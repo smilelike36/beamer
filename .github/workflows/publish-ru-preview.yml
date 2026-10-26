@@ -1,0 +1,33 @@
+name: Publish RU preview installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: smilelike36/beamer
+    steps:
+      - name: Download verified Windows build
+        run: gh run download 40358746266 --repo "$GH_REPO" --name Beamer-Windows-RU-Installer --dir preview
+      - name: Verify installer checksum
+        run: |
+          python - <<'PYVERIFY'
+          import hashlib,pathlib
+          root=pathlib.Path('preview')
+          hashes=list(root.rglob('SHA256SUMS.txt'))
+          assert len(hashes)==1
+          for line in hashes[0].read_text(encoding='utf-8-sig').splitlines():
+              digest,name=line.split(None,1)
+              target=hashes[0].parent/name.strip()
+              assert target.is_file()
+              assert hashlib.sha256(target.read_bytes()).hexdigest()==digest
+          print('Installer SHA256 verified')
+          PYVERIFY
+      - name: Publish unofficial preview download
+        run: |
+          gh release create v1.5.14-ru.2 --repo "$GH_REPO" --target feature/russian-ui-keyboard-sync --prerelease --title "Beamer RU preview 1.5.14-ru.2" --notes "Unofficial GPL-3.0-only community preview with Russian UI and opt-in RU/EN keyboard synchronisation. Built and checked on Windows in run 40358746266. Python is bundled; it is not required on the destination PC. Mac Fn switching requires the Mac ru.2 preview. Source and review: https://github.com/kalkman-code/beamer/pull/49. This is not an official Kalkman Code release and has no release code-signing certificate." $(find preview -name '*.exe' -type f) $(find preview -name SHA256SUMS.txt -type f)

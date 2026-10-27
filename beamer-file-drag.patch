@@ -1,3 +1,73 @@
+diff --git a/.github/workflows/windows-ru-preview.yml b/.github/workflows/windows-ru-preview.yml
+deleted file mode 100644
+index 6a07bb8..0000000
+--- a/.github/workflows/windows-ru-preview.yml
++++ /dev/null
+@@ -1,64 +0,0 @@
+-name: Windows RU preview installer
+-
+-on:
+-  workflow_dispatch:
+-  push:
+-    branches: [feature/russian-ui-keyboard-sync]
+-
+-permissions:
+-  contents: read
+-
+-jobs:
+-  installer:
+-    runs-on: windows-2025
+-    timeout-minutes: 30
+-    defaults:
+-      run:
+-        shell: pwsh
+-    steps:
+-      - uses: actions/checkout@v7
+-      - uses: actions/setup-python@v7
+-        with:
+-          python-version: '3.12'
+-          architecture: x64
+-          cache: pip
+-          cache-dependency-path: win_app/requirements-win.txt
+-      - name: Install build dependencies
+-        run: |
+-          python -m pip install -r win_app/requirements-win.txt
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-      - name: Check translations and shared input protocol
+-        run: |
+-          python tools/i18n_extract.py --check --complete
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-          python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_i18n core.tests.test_i18n_coverage
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-      - name: Check Windows keyboard handling and settings
+-        env:
+-          PYTHONPATH: .;win_app;win_app/tests
+-          QT_QPA_PLATFORM: offscreen
+-        run: |
+-          python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-      - name: Freeze standalone Windows application
+-        run: |
+-          python -m PyInstaller --clean --noconfirm --distpath win_app/dist --workpath build-windows win_app/build.spec
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-          $probe = Start-Process win_app/dist/Beamer.exe -ArgumentList @('--import-probe', "$PWD/import-probe.txt", 'keyboard_language', 'core.keyboard_sync', 'PySide6.QtWidgets', '_cffi_backend') -Wait -PassThru
+-          if ($probe.ExitCode -ne 0) { Get-Content import-probe.txt; throw 'Frozen application import probe failed' }
+-      - name: Compile Windows setup executable
+-        run: |
+-          choco install innosetup --no-progress --yes
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-          & "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" /DCommunityPreview /O"$PWD/installer-output" win_app/Beamer-Setup.iss
+-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+-          Get-ChildItem installer-output/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content installer-output/SHA256SUMS.txt
+-      - uses: actions/upload-artifact@v7
+-        with:
+-          name: Beamer-Windows-RU-Installer
+-          path: |
+-            installer-output/*.exe
+-            installer-output/SHA256SUMS.txt
+-            import-probe.txt
+-          if-no-files-found: error
+-          retention-days: 30
 diff --git a/core/drag_coordinator.py b/core/drag_coordinator.py
 new file mode 100644
 index 0000000..eca60a2
@@ -2762,10 +2832,10 @@ index 0000000..14f35f6
 +            panel.orderOut_(None)
 diff --git a/mac_app/file_shelf_mac.py b/mac_app/file_shelf_mac.py
 new file mode 100644
-index 0000000..54a72e8
+index 0000000..8857353
 --- /dev/null
 +++ b/mac_app/file_shelf_mac.py
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,159 @@
 +"""A small Finder-compatible shelf window for explicit user file drops."""
 +from pathlib import Path
 +
@@ -2812,7 +2882,8 @@ index 0000000..54a72e8
 +        return AppKit.NSDragOperationCopy
 +
 +    def draggingSession_endedAtPoint_operation_(self, session, point, operation):
-+        pass
++        if operation != AppKit.NSDragOperationNone:
++            self.owner.hide()
 +
 +
 +class ShelfWindow(AppKit.NSObject):
@@ -2822,24 +2893,41 @@ index 0000000..54a72e8
 +            return None
 +        self.shelf, self.sender = shelf, sender
 +        self.last_files = None
-+        rect = AppKit.NSMakeRect(80, 120, 320, 240)
-+        style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable | AppKit.NSWindowStyleMaskNonactivatingPanel
++        self.drag_reveal = False
++        self.sending = False
++        rect = AppKit.NSMakeRect(80, 120, 270, 142)
++        style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
 +        self.panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, style, AppKit.NSBackingStoreBuffered, False)
 +        self.panel.setTitle_(tr("Beamer file shelf"))
++        self.panel.setOpaque_(False)
++        self.panel.setBackgroundColor_(AppKit.NSColor.clearColor())
++        self.panel.setHasShadow_(True)
 +        self.panel.setFloatingPanel_(True)
 +        self.panel.setLevel_(AppKit.NSFloatingWindowLevel)
-+        self.view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 320, 240), self)
++        self.view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 270, 142), self)
 +        self.panel.setContentView_(self.view)
-+        self.header = AppKit.NSTextField.labelWithString_(tr("Drop files here or drag a received file out"))
-+        self.header.setFrame_(AppKit.NSMakeRect(12, 205, 296, 24))
++        self.view.setWantsLayer_(True)
++        self.view.layer().setBackgroundColor_(AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.06, 0.96).CGColor())
++        self.view.layer().setCornerRadius_(22)
++        self.view.layer().setMasksToBounds_(True)
++        self.header = AppKit.NSTextField.labelWithString_(tr("File shelf"))
++        self.header.setFrame_(AppKit.NSMakeRect(16, 110, 210, 20))
++        self.header.setTextColor_(AppKit.NSColor.whiteColor())
++        self.header.setFont_(AppKit.NSFont.boldSystemFontOfSize_(13))
 +        self.view.addSubview_(self.header)
++        close = AppKit.NSButton.buttonWithTitle_target_action_("×", self, "closeShelf:")
++        close.setFrame_(AppKit.NSMakeRect(238, 108, 22, 22))
++        close.setBezelStyle_(AppKit.NSBezelStyleCircular)
++        self.view.addSubview_(close)
 +        self.status = AppKit.NSTextField.labelWithString_("")
-+        self.status.setFrame_(AppKit.NSMakeRect(12, 12, 296, 22))
++        self.status.setFrame_(AppKit.NSMakeRect(16, 8, 238, 18))
++        self.status.setTextColor_(AppKit.NSColor.lightGrayColor())
 +        self.view.addSubview_(self.status)
-+        self.scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(8, 40, 304, 160))
++        self.scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(12, 30, 246, 74))
 +        self.scroll.setHasVerticalScroller_(True)
-+        self.scroll.setBorderType_(AppKit.NSBezelBorder)
-+        self.list_view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 280, 160), self)
++        self.scroll.setBorderType_(AppKit.NSNoBorder)
++        self.scroll.setDrawsBackground_(False)
++        self.list_view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 228, 74), self)
 +        self.scroll.setDocumentView_(self.list_view)
 +        self.view.addSubview_(self.scroll)
 +        self.rows = []
@@ -2849,13 +2937,44 @@ index 0000000..54a72e8
 +
 +    @objc.python_method
 +    def show(self):
++        screen = AppKit.NSScreen.mainScreen()
++        if screen:
++            visible = screen.visibleFrame()
++            self.panel.setFrameOrigin_(AppKit.NSMakePoint(
++                visible.origin.x + visible.size.width - 286, visible.origin.y + 16))
 +        self.panel.orderFrontRegardless()
 +
 +    @objc.python_method
++    def show_for_drag(self):
++        self.drag_reveal = True
++        self.show()
++
++    @objc.python_method
++    def hide(self):
++        self.drag_reveal = False
++        self.panel.orderOut_(None)
++
++    def closeShelf_(self, _sender):
++        self.hide()
++
++    @objc.python_method
 +    def send(self, paths):
-+        self.sender(paths, lambda text: AppHelper.callAfter(self.status.setStringValue_, text))
++        self.sending = True
++        self.sender(paths, lambda text: AppHelper.callAfter(self._status_changed, text))
++        self.hide()
++
++    @objc.python_method
++    def _status_changed(self, text):
++        self.status.setStringValue_(text)
++        if text != tr("Transferring files…"):
++            self.refresh_(None)
++            self.sending = False
++            if text != tr("Files transferred."):
++                self.show()
 +
 +    def refresh_(self, _timer):
++        if self.drag_reveal and not (AppKit.NSEvent.pressedMouseButtons() & 1):
++            self.hide()
 +        files = self.shelf.list_files()
 +        if files == self.last_files:
 +            return
@@ -2864,19 +2983,20 @@ index 0000000..54a72e8
 +        for row in self.rows:
 +            row.removeFromSuperview()
 +        self.rows = []
-+        height = max(160, len(files) * 26)
-+        self.list_view.setFrameSize_(AppKit.NSMakeSize(280, height))
++        height = max(74, len(files) * 26)
++        self.list_view.setFrameSize_(AppKit.NSMakeSize(228, height))
 +        for index, path in enumerate(files):
-+            row = ShelfFileButton.alloc().initWithFrame_(AppKit.NSMakeRect(2, height - (index + 1) * 26, 276, 24))
++            row = ShelfFileButton.alloc().initWithFrame_(AppKit.NSMakeRect(2, height - (index + 1) * 26, 224, 24))
 +            row.file_path = str(path)
++            row.owner = self
 +            row.setTitle_(path.name)
 +            row.setToolTip_(str(path))
 +            self.list_view.addSubview_(row)
 +            self.rows.append(row)
-+        if had_files:
++        if had_files and not self.sending:
 +            self.show()
 diff --git a/mac_app/kvm_bridge_app.py b/mac_app/kvm_bridge_app.py
-index 49ea3f8..29a9077 100644
+index 49ea3f8..e0a18a5 100644
 --- a/mac_app/kvm_bridge_app.py
 +++ b/mac_app/kvm_bridge_app.py
 @@ -2353,6 +2353,15 @@ class ControlWindow(AppKit.NSObject):
@@ -2887,7 +3007,7 @@ index 49ea3f8..29a9077 100644
 +            import file_shelf_mac
 +            self.file_shelf_window = file_shelf_mac.ShelfWindow.alloc().initWithShelf_sender_(
 +                self.controller._file_shelf_links.shelf, self.controller.send_shelf_files)
-+            self.controller.on_shelf_drag = lambda: AppHelper.callAfter(self.file_shelf_window.show)
++            self.controller.on_shelf_drag = lambda: AppHelper.callAfter(self.file_shelf_window.show_for_drag)
 +            shelf_module = widgets.Module()
 +            shelf_module.add(widgets.Label(tr("File shelf"), theme.TYPE["body"]).view)
 +            shelf_module.add(widgets.Button(tr("Open file shelf"), self, "openFileShelf:").view)
@@ -3222,10 +3342,10 @@ index 5b3d931..b20dc76 100644
          )
 diff --git a/win_app/file_drag_win.py b/win_app/file_drag_win.py
 new file mode 100644
-index 0000000..7bf308e
+index 0000000..07c39ed
 --- /dev/null
 +++ b/win_app/file_drag_win.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,142 @@
 +"""Windows Qt building blocks for a native file drag.
 +
 +The application must arrange an OLE drop target at the crossing and initiate
@@ -3268,6 +3388,28 @@ index 0000000..7bf308e
 +    drag = QDrag(widget)
 +    drag.setMimeData(mime)
 +    return drag.exec(Qt.DropAction.CopyAction)
++
++
++def explorer_file_area_at_pointer():
++    """Best-effort filter: a press must begin in Explorer's file list or desktop.
++
++    This does not prove that the drag contains files. The shelf's native drop
++    target remains responsible for validating the actual data.
++    """
++    if sys.platform != "win32":
++        return False
++    try:
++        import win32gui
++        window = win32gui.WindowFromPoint(win32gui.GetCursorPos())
++        root = win32gui.GetAncestor(window, 2)  # GA_ROOT
++        root_class = win32gui.GetClassName(root)
++        window_class = win32gui.GetClassName(window)
++        if root_class in ("Progman", "WorkerW"):
++            return window_class in ("SysListView32", "DirectUIHWND")
++        return (root_class in ("CabinetWClass", "ExploreWClass")
++                and window_class in ("SysListView32", "DirectUIHWND"))
++    except Exception:
++        return False
 +
 +
 +def button_down():
@@ -3348,22 +3490,25 @@ index 0000000..7bf308e
 +            self.files_retained.emit(paths, release)
 diff --git a/win_app/file_shelf_win.py b/win_app/file_shelf_win.py
 new file mode 100644
-index 0000000..c94f414
+index 0000000..e167254
 --- /dev/null
 +++ b/win_app/file_shelf_win.py
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,137 @@
 +"""Small Windows shelf using real Qt/Explorer file drag events."""
 +from pathlib import Path
 +from core.i18n import tr
 +from PySide6.QtCore import Qt, QTimer, QUrl, QMimeData, Signal
 +from PySide6.QtGui import QDrag
-+from PySide6.QtWidgets import QAbstractItemView, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
++from PySide6.QtWidgets import (QAbstractItemView, QApplication, QHBoxLayout, QLabel, QListWidget,
++                               QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
++from file_drag_win import button_down
 +
 +
 +class ShelfList(QListWidget):
-+    def __init__(self, dropped):
++    def __init__(self, dropped, dragged_out):
 +        super().__init__()
 +        self._dropped = dropped
++        self._dragged_out = dragged_out
 +        self.setAcceptDrops(True)
 +        self.setDragEnabled(True)
 +        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
@@ -3395,21 +3540,45 @@ index 0000000..c94f414
 +        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
 +        drag = QDrag(self)
 +        drag.setMimeData(mime)
-+        drag.exec(Qt.DropAction.CopyAction)
++        if drag.exec(Qt.DropAction.CopyAction) == Qt.DropAction.CopyAction:
++            self._dragged_out()
 +
 +
 +class ShelfWindow(QWidget):
 +    status_changed = Signal(str)
 +    def __init__(self, shelf, send, parent=None):
-+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
++        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint |
++                         Qt.WindowType.WindowStaysOnTopHint)
++        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
++        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
++        self.drag_reveal = False
++        self.sending = False
 +        self.shelf, self.send = shelf, send
 +        self.setWindowTitle(tr("Beamer file shelf"))
-+        self.resize(300, 220)
++        self.resize(270, 142)
++        self.setObjectName("shelf")
++        self.setStyleSheet("""
++            QWidget#shelf { background: rgba(15, 15, 18, 245); border-radius: 22px; }
++            QLabel { color: white; font-size: 13px; font-weight: 600; }
++            QListWidget { background: transparent; color: white; border: none; }
++            QListWidget::item { padding: 4px 6px; border-radius: 8px; }
++            QListWidget::item:selected { background: #42424a; }
++            QPushButton { background: #333338; color: white; border: none;
++                          border-radius: 10px; font-size: 16px; }
++        """)
 +        layout = QVBoxLayout(self)
-+        layout.addWidget(QLabel(tr("Drop files here or drag a received file out")))
++        layout.setContentsMargins(16, 10, 12, 9)
++        layout.setSpacing(3)
++        heading = QHBoxLayout()
++        heading.addWidget(QLabel(tr("File shelf")))
++        close = QPushButton("×")
++        close.setFixedSize(22, 22)
++        close.clicked.connect(self.hide)
++        heading.addWidget(close)
++        layout.addLayout(heading)
 +        self.status = QLabel("")
-+        self.status_changed.connect(self.status.setText)
-+        self.list = ShelfList(self._drop)
++        self.status_changed.connect(self._status_changed)
++        self.list = ShelfList(self._drop, self.hide)
 +        layout.addWidget(self.list)
 +        layout.addWidget(self.status)
 +        self._last = None
@@ -3419,10 +3588,37 @@ index 0000000..c94f414
 +        self.timer.start()
 +        self.refresh()
 +
++    def show(self):
++        screen = QApplication.primaryScreen()
++        if screen:
++            rect = screen.availableGeometry()
++            self.move(rect.right() - self.width() - 15, rect.bottom() - self.height() - 15)
++        super().show()
++
++    def show_for_drag(self):
++        self.drag_reveal = True
++        self.show()
++
++    def hide(self):
++        self.drag_reveal = False
++        super().hide()
++
 +    def _drop(self, paths):
++        self.sending = True
 +        self.send(paths, self.status_changed.emit)
++        self.hide()
++
++    def _status_changed(self, text):
++        self.status.setText(text)
++        if text != tr("Transferring files…"):
++            self.refresh()
++            self.sending = False
++            if text != tr("Files transferred."):
++                self.show()
 +
 +    def refresh(self):
++        if self.drag_reveal and not button_down():
++            self.hide()
 +        files = self.shelf.list_files()
 +        if files == self._last:
 +            return
@@ -3433,10 +3629,10 @@ index 0000000..c94f414
 +            item.setToolTip(str(path))
 +            item.setData(Qt.ItemDataRole.UserRole, str(path))
 +            self.list.addItem(item)
-+        if files and not self.isVisible():
++        if files and not self.sending and not self.isVisible():
 +            self.show()
 diff --git a/win_app/kvm_bridge_win.py b/win_app/kvm_bridge_win.py
-index abb6c37..c026a7e 100644
+index abb6c37..1a03e7b 100644
 --- a/win_app/kvm_bridge_win.py
 +++ b/win_app/kvm_bridge_win.py
 @@ -64,6 +64,9 @@ from app_config import (
@@ -3497,7 +3693,7 @@ index abb6c37..c026a7e 100644
              paired_callback=self._store_paired,
              link_callback=lambda peer, up: self.bridge.peers_changed.emit(),
              announce=self._announce,
-@@ -672,6 +702,12 @@ class WindowsApplication(QWidget):
+@@ -672,6 +702,15 @@ class WindowsApplication(QWidget):
          app.screenRemoved.connect(self._displays_changed)
          self._refresh_own_displays()
          self.sender.driven = lambda: self.server.driven
@@ -3505,12 +3701,15 @@ index abb6c37..c026a7e 100644
 +            self.sender.file_transfer_callback = self._receive_outbound_file_drag
 +            self.sender.file_shelf_callback = self._receive_outbound_file_shelf
 +            self.sender.file_shelf_drag_callback = self.bridge.file_shelf_show.emit
++            if sys.platform == "win32":
++                from file_drag_win import explorer_file_area_at_pointer
++                self.sender.file_shelf_source_check = explorer_file_area_at_pointer
 +            self.sender.file_drag_edge_callback = self.bridge.file_drag_local_edge.emit
 +            self.sender.file_drag_release_callback = self._file_drag_local_release
          self.resistance_pressure_timer = QTimer(self)
          self.resistance_pressure_timer.setInterval(33)
          self.resistance_pressure_timer.timeout.connect(self._refresh_local_pressure)
-@@ -684,7 +720,7 @@ class WindowsApplication(QWidget):
+@@ -684,7 +723,7 @@ class WindowsApplication(QWidget):
              protocol.id_text(peer), read["edge"], read["set_at"], protocol.id_text(read["by"]), read.get("way_back"),
              protocol.id_text(read["way_back_by"]) if read.get("way_back_by") else None
          )
@@ -3519,7 +3718,7 @@ index abb6c37..c026a7e 100644
          self.sender.paired_callback = self._store_paired
          self.sender.hw_learned = self._learn_peer_hardware
          self.sender.announce = self._announce
-@@ -789,6 +825,11 @@ class WindowsApplication(QWidget):
+@@ -789,6 +828,11 @@ class WindowsApplication(QWidget):
          self.setWindowIcon(QIcon(str(ICON_PATH)))
          self.preview_loop = PreviewLoop(self)
          self.tile_hover = TileHover(self.preview_loop, self)
@@ -3527,11 +3726,11 @@ index abb6c37..c026a7e 100644
 +        if self._file_shelf_links is not None:
 +            from file_shelf_win import ShelfWindow
 +            self.file_shelf_window = ShelfWindow(self._file_shelf_links.shelf, self._send_shelf_files)
-+            self.bridge.file_shelf_show.connect(self.file_shelf_window.show)
++            self.bridge.file_shelf_show.connect(self.file_shelf_window.show_for_drag)
          self._build_window()
          self._apply_theme()
          self._build_tray()
-@@ -963,6 +1004,10 @@ class WindowsApplication(QWidget):
+@@ -963,6 +1007,10 @@ class WindowsApplication(QWidget):
              on_pin=self._set_peer_pin,
          )
          layout.addWidget(self.machines)
@@ -3542,7 +3741,7 @@ index abb6c37..c026a7e 100644
          layout.addWidget(self._name_module(current))
          self.sheet = machines_win.PairingSheet(
              self._show_code, self._cancel_code, self._pair_clicked, self._pick_machine,
-@@ -1944,6 +1989,124 @@ class WindowsApplication(QWidget):
+@@ -1944,6 +1992,124 @@ class WindowsApplication(QWidget):
                                              self._peer_caps().get(peer, ())))
          return messages
  
@@ -3667,7 +3866,7 @@ index abb6c37..c026a7e 100644
      def _driver_platform(self) -> str:
          """The platform of the machine driving this PC now, or "" when none is. From the peers the
          window last read, not settings.json: this runs on the responder's thread as input lands."""
-@@ -1963,8 +2126,8 @@ class WindowsApplication(QWidget):
+@@ -1963,8 +2129,8 @@ class WindowsApplication(QWidget):
              "platform": OWN_PLATFORM,
              "app": VERSION[:32] if VERSION.isascii() and VERSION.isprintable() else "dev",
              # A swipe has no shortcut every Linux desktop shares, so Linux does not offer gestures.
@@ -3678,7 +3877,7 @@ index abb6c37..c026a7e 100644
              "port": self._settings_port,
          }
  
-@@ -5171,6 +5334,14 @@ class WindowsApplication(QWidget):
+@@ -5171,6 +5337,14 @@ class WindowsApplication(QWidget):
          # refresh rather than letting its hooks and this copy's hooks keep running together.
          self._input_controller_blocked = True
          self.server.stop()
@@ -3693,7 +3892,7 @@ index abb6c37..c026a7e 100644
          self._stop_sending()
          release, self._input_controller_release = self._input_controller_release, None
          release()
-@@ -5466,6 +5637,14 @@ class WindowsApplication(QWidget):
+@@ -5466,6 +5640,14 @@ class WindowsApplication(QWidget):
              self.pairing.cancel_nearby()
              self.pairing.stop()
          self.server.stop()
@@ -3709,7 +3908,7 @@ index abb6c37..c026a7e 100644
          shortcut = getattr(self, "global_shortcut", None)
          if shortcut is not None:
 diff --git a/win_app/sender.py b/win_app/sender.py
-index de19d8a..a39b56f 100644
+index de19d8a..ace4c1f 100644
 --- a/win_app/sender.py
 +++ b/win_app/sender.py
 @@ -28,6 +28,9 @@ import time
@@ -3722,7 +3921,7 @@ index de19d8a..a39b56f 100644
  import keyboard_language
  from core import ignored
  from core import keytable
-@@ -250,6 +253,13 @@ class LinkSender:
+@@ -250,6 +253,15 @@ class LinkSender:
          self.arrangement_callback: Optional[Callable] = None
          self.settings_callback: Optional[Callable] = None
          self.identify_callback: Optional[Callable] = None
@@ -3730,18 +3929,27 @@ index de19d8a..a39b56f 100644
 +        self.file_shelf_callback: Optional[Callable] = None
 +        self.file_shelf_drag_callback: Optional[Callable] = None
 +        self._file_shelf_shown = False
++        self.file_shelf_source_check: Optional[Callable] = None
++        self._file_shelf_candidate = False
 +        self.file_drag_edge_callback: Optional[Callable] = None
 +        self.file_drag_release_callback: Optional[Callable] = None
 +        self._file_drag_probe_at = float("-inf")
          self.paired_callback: Optional[Callable] = None
          self.link_callback: Optional[Callable[[bytes, bool], None]] = None
  
-@@ -695,10 +705,14 @@ class LinkSender:
+@@ -695,10 +707,21 @@ class LinkSender:
  
      def on_button(self, name: str, down: bool) -> bool:
          """A mouse button, from the hook thread: True when it is not for this PC."""
 +        if name == "left" and down:
 +            self._file_shelf_shown = False
++            check = self.file_shelf_source_check
++            try:
++                self._file_shelf_candidate = bool(check and check())
++            except Exception:
++                self._file_shelf_candidate = False
++        elif name == "left":
++            self._file_shelf_candidate = False
          if down:
              self._buttons_held.add(name)
          else:
@@ -3751,23 +3959,25 @@ index de19d8a..a39b56f 100644
          if self._shake_detector is not None:
              self._shake_detector.held(self._clock(), bool(self._buttons_held or self._keys_down))
          owner = self._owner
-@@ -745,6 +759,15 @@ class LinkSender:
+@@ -745,6 +768,17 @@ class LinkSender:
      def on_motion(self, dx: int, dy: int) -> None:
          """One raw mouse movement, in the mouse's own counts. Consumes nothing: raw input cannot
          block an event, so the hook above is what keeps the movement off this PC."""
 +        if (not self.redirecting and "left" in self._buttons_held and not self._file_shelf_shown
++                and self._file_shelf_candidate
 +                and self.file_shelf_drag_callback is not None
 +                and any("file_shelf" in self.links.caps(peer) for peer in self.peers_up())):
 +            self._file_shelf_shown = True
 +            self._call(self.file_shelf_drag_callback)
 +        if (not self.redirecting and "left" in self._buttons_held
++                and self._file_shelf_candidate
 +                and self.file_shelf_drag_callback is not None
 +                and any("file_shelf" in self.links.caps(peer) for peer in self.peers_up())):
 +            return
          if self.redirecting:
              if not self._live():
                  self._lost()
-@@ -828,7 +851,9 @@ class LinkSender:
+@@ -828,7 +862,9 @@ class LinkSender:
          if ((self._home_hold is not None and self._home_hold.blocks(self._clock()))
                  or not self._models or self.edges_held or self._owner is None):
              return
@@ -3778,7 +3988,7 @@ index de19d8a..a39b56f 100644
              # A drag that reaches the edge is dragging, not leaving: the push so far is dropped,
              # as the Mac drops it, so letting go at the edge does not finish a crossing.
              for _peer, model in self._models:
-@@ -848,6 +873,8 @@ class LinkSender:
+@@ -848,6 +884,8 @@ class LinkSender:
              outcome = model = target = None
              display_map = self._cached_display_map()
              for peer, candidate in list(self._models):
@@ -3787,7 +3997,7 @@ index de19d8a..a39b56f 100644
                  result = candidate.feed(monitors, pointer, float(dx), float(dy), display_map=display_map)
                  if result.action != return_edge.PASS:
                      outcome, model, target = result, candidate, peer
-@@ -868,6 +895,13 @@ class LinkSender:
+@@ -868,6 +906,13 @@ class LinkSender:
          self._notify_pressure(model.edge, outcome.pressure, outcome.action == return_edge.CROSS, part)
          if outcome.action == return_edge.CROSS:
              offset = receiver.corner_offset(model.corner, model.edge) if isinstance(model, return_edge.CornerPush) else outcome.offset
@@ -3801,7 +4011,7 @@ index de19d8a..a39b56f 100644
              # The model names the edge on the far side, not the one just left: it is the same
              # border, read from the other end. The display it leads to lands the pointer there, as
              # the Mac's own crossing does.
-@@ -943,6 +977,31 @@ class LinkSender:
+@@ -943,6 +988,31 @@ class LinkSender:
             display=None, side=None) -> bool:
          return self._go(peer, edge, offset, display, side)
  
@@ -3833,7 +4043,7 @@ index de19d8a..a39b56f 100644
      def _go(self, peer: bytes, edge=None, offset=None, display=None, side=None) -> bool:
          owner = self._owner
          if owner is None:
-@@ -1060,6 +1119,12 @@ class LinkSender:
+@@ -1060,6 +1130,12 @@ class LinkSender:
                      actions = self._owner.clipboard_arrived(peer, began_at if began_at is not None else self._clock(), clean)
                      self._queue(actions)
                  self._report(actions)
@@ -3929,10 +4139,10 @@ index 0000000..b1bea2d
 +        release.assert_called_once()
 diff --git a/win_app/tests/test_file_shelf_win.py b/win_app/tests/test_file_shelf_win.py
 new file mode 100644
-index 0000000..3bbcc84
+index 0000000..472a2c7
 --- /dev/null
 +++ b/win_app/tests/test_file_shelf_win.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,81 @@
 +import tempfile
 +import unittest
 +from pathlib import Path
@@ -3972,6 +4182,36 @@ index 0000000..3bbcc84
 +            event.ignore.assert_called_once()
 +            send.assert_not_called()
 +
++    def test_drag_reveal_closes_on_release(self):
++        with tempfile.TemporaryDirectory() as root:
++            window = ShelfWindow(FileShelf(Path(root)), mock.Mock())
++            self.addCleanup(window.close)
++            self.addCleanup(window.timer.stop)
++            with mock.patch("file_shelf_win.button_down", return_value=True):
++                window.show_for_drag()
++                window.refresh()
++                self.assertTrue(window.isVisible())
++            with mock.patch("file_shelf_win.button_down", return_value=False):
++                window.refresh()
++                self.assertFalse(window.isVisible())
++
++    def test_sender_does_not_reopen_for_its_own_saved_copy(self):
++        with tempfile.TemporaryDirectory() as root:
++            source = Path(root) / "source.txt"
++            source.write_text("test")
++            shelf = FileShelf(Path(root) / "shelf")
++            def send(paths, notify):
++                shelf.store_copy(paths[0])
++                notify("Files transferred.")
++            window = ShelfWindow(shelf, send)
++            self.addCleanup(window.close)
++            self.addCleanup(window.timer.stop)
++            window.show()
++            window._drop([source])
++            window.refresh()
++            self.assertFalse(window.isVisible())
++            self.assertEqual(window.list.count(), 1)
++
 +    def test_completed_file_becomes_a_draggable_shelf_row(self):
 +        with tempfile.TemporaryDirectory() as root:
 +            source = Path(root) / "данные.txt"
@@ -3985,7 +4225,7 @@ index 0000000..3bbcc84
 +            self.assertEqual(window.list.count(), 1)
 +            self.assertEqual(window.list.item(0).data(Qt.ItemDataRole.UserRole), str(stored))
 diff --git a/win_app/tests/test_links.py b/win_app/tests/test_links.py
-index 3978539..1a1c468 100644
+index 3978539..5170078 100644
 --- a/win_app/tests/test_links.py
 +++ b/win_app/tests/test_links.py
 @@ -145,6 +145,22 @@ class EdgeTests(unittest.TestCase):
@@ -4011,3 +4251,33 @@ index 3978539..1a1c468 100644
  
  class CornerTests(unittest.TestCase):
      """The corner is for a machine whose whole edge is busy: it wants a diagonal push in an
+@@ -910,6 +926,29 @@ class MouseTests(unittest.TestCase):
+         self.rig = Rig()
+         self.sender = self.rig.sender
+ 
++    def test_file_shelf_ignores_drag_from_other_apps(self):
++        callback = mock.Mock()
++        self.sender.file_shelf_drag_callback = callback
++        self.sender.file_shelf_source_check = lambda: False
++        self.sender.peers_up = lambda: [B]
++        self.sender.links.caps = lambda _peer: {"file_shelf"}
++        self.sender._call = lambda fn, *args: fn(*args)
++        self.sender.on_button("left", True)
++        self.sender.on_motion(5, 5)
++        callback.assert_not_called()
++
++    def test_file_shelf_reveals_for_file_area_drag(self):
++        callback = mock.Mock()
++        self.sender.file_shelf_drag_callback = callback
++        self.sender.file_shelf_source_check = lambda: True
++        self.sender.peers_up = lambda: [B]
++        self.sender.links.caps = lambda _peer: {"file_shelf"}
++        self.sender._call = lambda fn, *args: fn(*args)
++        self.sender.on_button("left", True)
++        self.sender.on_motion(5, 5)
++        self.sender.on_motion(5, 5)
++        callback.assert_called_once()
++
+     def test_nothing_is_swallowed_or_sent_while_input_is_this_pcs(self):
+         self.assertFalse(self.sender.on_button("left", True))
+         self.assertFalse(self.sender.on_wheel(1.0, 0.0))

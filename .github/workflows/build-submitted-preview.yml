@@ -1,83 +1,29 @@
-name: Build submitted RU preview installer
-
+name: Prepare separate source branches
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
-  installer:
-    runs-on: windows-2025
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: pwsh
+  prepare:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Materialise reviewed contribution branch
+      - name: Verify and publish separate source branches
         run: |
-          $patch = Join-Path $env:RUNNER_TEMP 'contribution.patch'
-          Copy-Item contribution.patch $patch
-          $actual = (Get-FileHash $patch -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne 'ba32cc5b12f46e669d98a5f7fa454ef906d962c7b843b3eee9cfedca2e077c23') { throw 'Unexpected contribution patch' }
+          set -euo pipefail
+          echo 'ba765f978593a52ddeb38c450dfe6dde1640e1f9559604272a7f2609dd48d5f6  russian-split.patch' | sha256sum -c -
+          echo 'a5607ff47de6fa8fbd777dfe9dc62790529aae802a44dbeec5bd72b91f2a51b7  layout-split.patch' | sha256sum -c -
+          cp russian-split.patch layout-split.patch "$RUNNER_TEMP/"
           git config user.name 'smilelike36'
           git config user.email '89850871+smilelike36@users.noreply.github.com'
-          git fetch origin feature/russian-ui-keyboard-sync
-          if ($LASTEXITCODE -eq 0) {
-            git checkout -B feature/russian-ui-keyboard-sync origin/feature/russian-ui-keyboard-sync
-          } else {
-            git checkout -B feature/russian-ui-keyboard-sync 324edd5731bcff9c28229c0c8a54d547c1b2af29
-            git am $patch
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            git push origin HEAD:feature/russian-ui-keyboard-sync
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          architecture: x64
-          cache: pip
-          cache-dependency-path: win_app/requirements-win.txt
-      - name: Install build dependencies
-        run: |
-          python -m pip install -r win_app/requirements-win.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check translations and shared input protocol
-        run: |
-          python tools/i18n_extract.py --check --complete
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_i18n core.tests.test_i18n_coverage
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check Windows keyboard handling and settings
-        env:
-          PYTHONPATH: .;win_app;win_app/tests
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Freeze standalone Windows application
-        run: |
-          python -m PyInstaller --clean --noconfirm --distpath win_app/dist --workpath build-windows win_app/build.spec
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $probe = Start-Process win_app/dist/Beamer.exe -ArgumentList @('--import-probe', "$PWD/import-probe.txt", 'keyboard_language', 'core.keyboard_sync', 'PySide6.QtWidgets', '_cffi_backend') -Wait -PassThru
-          if ($probe.ExitCode -ne 0) { Get-Content import-probe.txt; throw 'Frozen application import probe failed' }
-      - name: Compile Windows setup executable
-        run: |
-          choco install innosetup --no-progress --yes
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ((Get-ChildItem "${env:ProgramFiles(x86)}/Inno Setup*/ISCC.exe" | Select-Object -First 1).FullName) /DCommunityPreview /O"$PWD/installer-output" win_app/Beamer-Setup.iss
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-ChildItem installer-output/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content installer-output/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v7
-        with:
-          name: Beamer-Windows-RU-Installer
-          path: |
-            installer-output/*.exe
-            installer-output/SHA256SUMS.txt
-            import-probe.txt
-          if-no-files-found: error
-          retention-days: 30
+          git fetch https://github.com/kalkman-code/beamer.git b3fcad8b811725c96d420c1dd86868289775396d
+          git checkout --detach FETCH_HEAD
+          git am "$RUNNER_TEMP/russian-split.patch"
+          test "$(git rev-parse HEAD^{tree})" = 20767153801ad419000705333736da9a1f617e6e
+          git push origin HEAD:refs/heads/split/russian-localisation
+          git checkout --detach b3fcad8b811725c96d420c1dd86868289775396d
+          git am "$RUNNER_TEMP/layout-split.patch"
+          test "$(git rev-parse HEAD^{tree})" = aa0bc1b9f6cd5d98eaf1f3da0e824013a9406f79
+          git push origin HEAD:refs/heads/split/layout-sync

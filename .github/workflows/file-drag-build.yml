@@ -17,7 +17,7 @@ jobs:
       - name: Apply verified file drag changes
         run: |
           $patch = "$PWD/beamer-file-drag.patch"
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne '13d1b67df74ba7475caea2a5825825f8a1da608210ab846c15ad0dbbc95403ad') { throw 'Patch checksum mismatch' }
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne 'c101a2dd3b1e36e05062444c06fe87469b1514264a557c7be558b4fe7b53e25f') { throw 'Patch checksum mismatch' }
           git apply --check $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply $patch

@@ -2533,10 +2533,10 @@ index 0000000..14f35f6
 +            panel.orderOut_(None)
 diff --git a/mac_app/file_shelf_mac.py b/mac_app/file_shelf_mac.py
 new file mode 100644
-index 0000000..923c91f
+index 0000000..a34be9e
 --- /dev/null
 +++ b/mac_app/file_shelf_mac.py
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,108 @@
 +"""A small Finder-compatible shelf window for explicit user file drops."""
 +from pathlib import Path
 +
@@ -2606,6 +2606,12 @@ index 0000000..923c91f
 +        self.status = AppKit.NSTextField.labelWithString_("")
 +        self.status.setFrame_(AppKit.NSMakeRect(12, 12, 296, 22))
 +        self.view.addSubview_(self.status)
++        self.scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(8, 40, 304, 160))
++        self.scroll.setHasVerticalScroller_(True)
++        self.scroll.setBorderType_(AppKit.NSBezelBorder)
++        self.list_view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 280, 160), self)
++        self.scroll.setDocumentView_(self.list_view)
++        self.view.addSubview_(self.scroll)
 +        self.rows = []
 +        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.8, self, "refresh:", None, True)
 +        self.refresh_(None)
@@ -2628,12 +2634,14 @@ index 0000000..923c91f
 +        for row in self.rows:
 +            row.removeFromSuperview()
 +        self.rows = []
-+        for index, path in enumerate(files[-6:]):
-+            row = ShelfFileButton.alloc().initWithFrame_(AppKit.NSMakeRect(12, 172 - index * 25, 296, 24))
++        height = max(160, len(files) * 26)
++        self.list_view.setFrameSize_(AppKit.NSMakeSize(280, height))
++        for index, path in enumerate(files):
++            row = ShelfFileButton.alloc().initWithFrame_(AppKit.NSMakeRect(2, height - (index + 1) * 26, 276, 24))
 +            row.file_path = str(path)
 +            row.setTitle_(path.name)
 +            row.setToolTip_(str(path))
-+            self.view.addSubview_(row)
++            self.list_view.addSubview_(row)
 +            self.rows.append(row)
 +        if had_files:
 +            self.show()

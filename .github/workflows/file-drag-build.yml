@@ -1,0 +1,78 @@
+name: Build file drag Windows preview
+on:
+  push:
+    branches: [build/file-drag-20261027]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Apply verified file drag changes
+        run: |
+          $patch = "$PWD/beamer-file-drag.patch"
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne '13d1b67df74ba7475caea2a5825825f8a1da608210ab846c15ad0dbbc95403ad') { throw 'Patch checksum mismatch' }
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.3-drag-preview`n", [Text.UTF8Encoding]::new($false))
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: win_app/requirements-win.txt
+      - name: Install build dependencies
+        run: |
+          python -m pip install -r win_app/requirements-win.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check file transfer and shared input
+        env:
+          PYTHONPATH: .;win_app;win_app/tests
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python tools/i18n_extract.py --check --complete
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_owner core.tests.test_drag_coordinator core.tests.test_drag_handoff core.tests.test_file_drag_receiver core.tests.test_file_transfer core.tests.test_file_transfer_link
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check Windows drag and input handling
+        working-directory: win_app
+        env:
+          PYTHONPATH: ..;tests;../core/tests
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages test_file_drag_win
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Freeze standalone Windows application
+        run: |
+          python -m PyInstaller --clean --noconfirm --distpath win_app/dist --workpath build-windows win_app/build.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $probe = Start-Process win_app/dist/Beamer.exe -ArgumentList @('--import-probe', "$PWD/import-probe.txt", 'keyboard_language', 'file_drag_win', 'core.drag_handoff', 'core.file_transfer', 'PySide6.QtWidgets', '_cffi_backend') -Wait -PassThru
+          if ($probe.ExitCode -ne 0) { Get-Content import-probe.txt; throw 'Frozen application import probe failed' }
+      - name: Compile setup executable
+        run: |
+          choco install innosetup --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}/Inno Setup*/ISCC.exe" | Select-Object -First 1).FullName
+          if (-not $iscc) { throw 'Inno Setup not found' }
+          & $iscc /DCommunityPreview /O"$PWD/installer-output" win_app/Beamer-Setup.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer-output/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content installer-output/SHA256SUMS.txt
+          git rev-parse HEAD | Set-Content installer-output/COMMIT.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Beamer-File-Drag-Windows-Installer
+          path: |
+            installer-output/*.exe
+            installer-output/SHA256SUMS.txt
+            installer-output/COMMIT.txt
+            import-probe.txt
+          if-no-files-found: error
+          retention-days: 30

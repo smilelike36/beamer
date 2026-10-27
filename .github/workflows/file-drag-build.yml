@@ -17,12 +17,12 @@ jobs:
       - name: Apply verified file drag changes
         run: |
           $patch = "$PWD/beamer-file-drag.patch"
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne 'c0c4cf32d8fa629caafa91b32abef7d8f2cd14ff7a30864c9c94f0027eda082a') { throw 'Patch checksum mismatch' }
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne '8875f1f40f6e556eef9da2a80891f4aeb152b5f083f216c26be7b96da6028018') { throw 'Patch checksum mismatch' }
           git apply --check $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.4-drag-preview`n", [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.5-shelf-preview`n", [Text.UTF8Encoding]::new($false))
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -40,7 +40,7 @@ jobs:
         run: |
           python tools/i18n_extract.py --check --complete
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_owner core.tests.test_drag_coordinator core.tests.test_drag_handoff core.tests.test_file_drag_receiver core.tests.test_file_transfer core.tests.test_file_transfer_link
+          python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_owner core.tests.test_drag_coordinator core.tests.test_drag_handoff core.tests.test_file_drag_receiver core.tests.test_file_transfer core.tests.test_file_transfer_link core.tests.test_file_shelf
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Check Windows drag and input handling
         working-directory: win_app
@@ -48,13 +48,13 @@ jobs:
           PYTHONPATH: ..;tests;../core/tests
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages test_file_drag_win
+          python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages test_file_drag_win test_file_shelf_win
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Freeze standalone Windows application
         run: |
           python -m PyInstaller --clean --noconfirm --distpath win_app/dist --workpath build-windows win_app/build.spec
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $probe = Start-Process win_app/dist/Beamer.exe -ArgumentList @('--import-probe', "$PWD/import-probe.txt", 'keyboard_language', 'file_drag_win', 'core.drag_handoff', 'core.file_transfer', 'PySide6.QtWidgets', '_cffi_backend') -Wait -PassThru
+          $probe = Start-Process win_app/dist/Beamer.exe -ArgumentList @('--import-probe', "$PWD/import-probe.txt", 'keyboard_language', 'file_drag_win', 'file_shelf_win', 'core.file_shelf', 'core.drag_handoff', 'core.file_transfer', 'PySide6.QtWidgets', '_cffi_backend') -Wait -PassThru
           if ($probe.ExitCode -ne 0) { Get-Content import-probe.txt; throw 'Frozen application import probe failed' }
       - name: Compile setup executable
         run: |
@@ -68,7 +68,7 @@ jobs:
           git rev-parse HEAD | Set-Content installer-output/COMMIT.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: Beamer-File-Drag-Windows-ru4
+          name: Beamer-File-Shelf-Windows-ru5
           path: |
             installer-output/*.exe
             installer-output/SHA256SUMS.txt

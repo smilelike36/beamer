@@ -2769,10 +2769,10 @@ index de19d8a..57bfb9b 100644
              if read is not None and self.arrangement_callback is not None:
 diff --git a/win_app/tests/test_file_drag_win.py b/win_app/tests/test_file_drag_win.py
 new file mode 100644
-index 0000000..007e450
+index 0000000..b1bea2d
 --- /dev/null
 +++ b/win_app/tests/test_file_drag_win.py
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +import tempfile
 +import unittest
 +from pathlib import Path
@@ -2791,7 +2791,7 @@ index 0000000..007e450
 +            path.write_text("test")
 +            mime = QMimeData()
 +            mime.setUrls([QUrl.fromLocalFile(str(path))])
-+            self.assertEqual(file_drag_win.local_files(mime), [str(path)])
++            self.assertEqual([Path(item) for item in file_drag_win.local_files(mime)], [path])
 +            mime.setUrls([QUrl.fromLocalFile(str(path)), QUrl("https://example.org/file")])
 +            self.assertEqual(file_drag_win.local_files(mime), [])
 +            mime.setUrls([QUrl.fromLocalFile(directory)])
@@ -2808,7 +2808,8 @@ index 0000000..007e450
 +            target = mock.Mock()
 +            file_drag_win.DragProbe.dragEnterEvent(target, event)
 +            event.ignore.assert_called_once()
-+            target.files_offered.emit.assert_called_once_with([str(path)])
++            target.files_offered.emit.assert_called_once()
++            self.assertEqual([Path(item) for item in target.files_offered.emit.call_args.args[0]], [path])
 +
 +    def test_native_host_keeps_files_after_copy_for_async_targets(self):
 +        host, release = mock.Mock(), mock.Mock()
@@ -2827,7 +2828,7 @@ index 0000000..007e450
 +            with mock.patch.object(file_drag_win, "QDrag", return_value=drag):
 +                file_drag_win.start_drag(mock.Mock(), [path])
 +            mime = drag.setMimeData.call_args.args[0]
-+            self.assertEqual(mime.urls()[0].toLocalFile(), str(path))
++            self.assertEqual(Path(mime.urls()[0].toLocalFile()), path)
 +
 +    def test_native_host_cleans_up_cancelled_drag(self):
 +        host, release = mock.Mock(), mock.Mock()

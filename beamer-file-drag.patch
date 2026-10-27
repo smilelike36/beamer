@@ -1630,7 +1630,7 @@ index 0000000..75c070f
 +The native Finder and Windows Explorer integration must be tested on actual
 +macOS and Windows desktops before this preview is treated as a release.
 diff --git a/mac_app/bridge.py b/mac_app/bridge.py
-index 5c6c5b5..ed376e1 100644
+index 5c6c5b5..7bb8448 100644
 --- a/mac_app/bridge.py
 +++ b/mac_app/bridge.py
 @@ -34,8 +34,13 @@ from core import identify_screens
@@ -1682,10 +1682,14 @@ index 5c6c5b5..ed376e1 100644
          self._return_local()
          # The let-go and what is ahead of it may be waiting behind a clipboard read: sent first.
          deadline = time.monotonic() + 1.0
-@@ -1846,6 +1863,13 @@ class KVMController:
+@@ -1846,6 +1863,17 @@ class KVMController:
                      self._repair_redirecting_disagreement()
                      return event
                  button = self.translator.button_of(event_type, event)
++                if button == ("left", True) and not self.redirecting:
++                    detector = getattr(self, "_file_drag_detector", None)
++                    if detector is not None:
++                        detector.arm()
 +                if button == ("left", False):
 +                    detector = getattr(self, "_file_drag_detector", None)
 +                    if detector is not None:
@@ -1696,7 +1700,7 @@ index 5c6c5b5..ed376e1 100644
                  if not self.redirecting:
                      if button is not None:
                          if button[1]:
-@@ -1939,6 +1963,100 @@ class KVMController:
+@@ -1939,6 +1967,100 @@ class KVMController:
          except Exception:
              return False
  
@@ -1797,7 +1801,7 @@ index 5c6c5b5..ed376e1 100644
      def _handle_local_mouse(self, event_type, event):
          """Crossing lives on the local side of the tap: while the pointer is
          pushing against an armed edge, the event is swallowed and the pointer
-@@ -1949,6 +2067,14 @@ class KVMController:
+@@ -1949,6 +2071,14 @@ class KVMController:
          CROSSING_RETRY_SECONDS or until the next settings save, so one broken
          geometry call cannot log an exception per mouse move -- and a passing
          one cannot leave the edge dead until someone thinks to save a setting."""
@@ -1807,12 +1811,12 @@ index 5c6c5b5..ed376e1 100644
 +        detector = getattr(self, "_file_drag_detector", None)
 +        supported = any("file_transfer" in getattr(link, "caps", ())
 +                        for link in self._peers_up.values())
-+        if drag_callback is not None and detector is not None and supported:
-+            paths = detector.update(left_drag)
++        if left_drag and drag_callback is not None and detector is not None and supported:
++            paths = detector.update(True)
          if self.home_hold.blocks(self.clock()):
              if event_type in self.translator.movement_event_types:
                  self.home_hold.motion(self.clock())
-@@ -1980,6 +2106,11 @@ class KVMController:
+@@ -1980,6 +2110,11 @@ class KVMController:
              x, y = location[0], location[1]
              dx = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaX)
              dy = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaY)
@@ -1824,7 +1828,7 @@ index 5c6c5b5..ed376e1 100644
              step = self.crossing.feed(
                  x,
                  y,
-@@ -1988,11 +2119,11 @@ class KVMController:
+@@ -1988,11 +2123,11 @@ class KVMController:
                  self._current_desktop_bounds(),
                  self.clock(),
                  notch_range=self.notch_range,
@@ -1838,7 +1842,7 @@ index 5c6c5b5..ed376e1 100644
              )
          except Exception:
              self._crossing_failed = True
-@@ -2001,6 +2132,15 @@ class KVMController:
+@@ -2001,6 +2136,15 @@ class KVMController:
              self.logger.exception("crossing failed; edge switching is off for %.0fs", CROSSING_RETRY_SECONDS)
              return event
          if step.crossed:
@@ -1854,7 +1858,7 @@ index 5c6c5b5..ed376e1 100644
              if self.receiving:
                  # Another machine is driving this Mac and this Mac's own pointer pushed through:
                  # that machine's input goes home first, and this Mac's follows it across once it
-@@ -2368,6 +2508,8 @@ class KVMController:
+@@ -2368,6 +2512,8 @@ class KVMController:
  
      def _drop_up(self, link):
          """The link is no longer one this Mac can send on: forget it and tell the owner."""
@@ -1863,7 +1867,7 @@ index 5c6c5b5..ed376e1 100644
          peer = link.peer_id
          if peer and self._peers_up.get(peer) is link:
              self._peers_up.pop(peer, None)
-@@ -2534,6 +2676,9 @@ class KVMController:
+@@ -2534,6 +2680,9 @@ class KVMController:
                      # Rebuilt from what was read: the owner sends it on to the machine input is on.
                      clean = protocol.clipboard_msg(read["text"], read["image"])
                      self._step(lambda owner: owner.clipboard_arrived(peer, began, clean))
@@ -1875,10 +1879,10 @@ index 5c6c5b5..ed376e1 100644
              elif kind == protocol.MSG_SETTINGS:
 diff --git a/mac_app/file_drag_mac.py b/mac_app/file_drag_mac.py
 new file mode 100644
-index 0000000..26b787c
+index 0000000..14f35f6
 --- /dev/null
 +++ b/mac_app/file_drag_mac.py
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,269 @@
 +"""Read actual file URLs from the macOS drag pasteboard at a crossing.
 +
 +This does not itself start a transfer or change the source drag session.
@@ -1926,47 +1930,95 @@ index 0000000..26b787c
 +        return []
 +
 +
-+class DragDetector:
-+    """Read the drag pasteboard off the input tap and discard stale results."""
++def drag_pasteboard_revision():
++    """Read the drag pasteboard revision, or None if it cannot be verified."""
++    if AppKit is None:
++        return None
++    try:
++        board = AppKit.NSPasteboard.pasteboardWithName_(AppKit.NSPasteboardNameDrag)
++        return int(board.changeCount())
++    except Exception:
++        return None
 +
-+    def __init__(self, read=dragged_file_paths):
++
++class DragDetector:
++    """Accept file URLs only after the pasteboard changes during this press."""
++
++    def __init__(self, read=dragged_file_paths, revision=drag_pasteboard_revision):
 +        self._read = read
++        self._revision = revision
 +        self._lock = threading.Lock()
 +        self._generation = 0
++        self._baseline = None
 +        self._active = False
 +        self._reading = False
 +        self._last_read = float("-inf")
 +        self._paths = ()
++        self._paths_revision = None
++
++    def arm(self):
++        # This snapshot precedes Finder publishing the next drag. If we cannot
++        # obtain it, fail closed rather than reuse a previous drag's contents.
++        try:
++            baseline = self._revision()
++        except Exception:
++            baseline = None
++        with self._lock:
++            self._generation += 1
++            self._baseline = baseline
++            self._active = False
++            self._reading = False
++            self._last_read = float("-inf")
++            self._paths = ()
++            self._paths_revision = None
 +
 +    def update(self, dragging):
 +        with self._lock:
 +            if not dragging:
-+                if self._active:
++                if self._active or self._baseline is not None:
 +                    self._generation += 1
 +                self._active = False
++                self._baseline = None
 +                self._paths = ()
++                self._paths_revision = None
 +                self._reading = False
++                return ()
++            if self._baseline is None:
 +                return ()
 +            if not self._active:
 +                self._active = True
-+                self._generation += 1
-+                self._last_read = float("-inf")
++            # Recheck the revision before consuming a cached selection. A new
++            # pasteboard write invalidates it, even within one button press.
++            try:
++                current = self._revision()
++            except Exception:
++                current = None
++            if current is None or current == self._baseline:
++                self._paths = ()
++                self._paths_revision = None
++                return ()
++            if self._paths_revision != current:
++                self._paths = ()
++                self._paths_revision = None
 +            if not self._paths and not self._reading and time.monotonic() - self._last_read >= 0.1:
 +                generation = self._generation
 +                self._reading = True
 +                self._last_read = time.monotonic()
-+                threading.Thread(target=self._read_async, args=(generation,),
++                threading.Thread(target=self._read_async, args=(generation, current),
 +                                 name="Beamer-drag-pasteboard", daemon=True).start()
 +            return self._paths
 +
-+    def _read_async(self, generation):
++    def _read_async(self, generation, expected_revision):
 +        try:
 +            paths = tuple(self._read())
++            observed_revision = self._revision()
 +        except Exception:
-+            paths = ()
++            paths, observed_revision = (), None
 +        with self._lock:
 +            if self._active and generation == self._generation:
-+                self._paths = paths
++                if observed_revision == expected_revision:
++                    self._paths = paths
++                    self._paths_revision = expected_revision
 +                self._reading = False
 +
 +
@@ -2114,10 +2166,10 @@ index 49ea3f8..022cb16 100644
          instance_socket_path(), lambda: AppHelper.callAfter(app.open_window, None)
 diff --git a/mac_app/tests/test_file_drag_bridge.py b/mac_app/tests/test_file_drag_bridge.py
 new file mode 100644
-index 0000000..6b33c2b
+index 0000000..d4c2968
 --- /dev/null
 +++ b/mac_app/tests/test_file_drag_bridge.py
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,173 @@
 +import threading
 +import unittest
 +from collections import deque
@@ -2139,12 +2191,68 @@ index 0000000..6b33c2b
 +            began.set()
 +            continue_read.wait(2)
 +            return ["/tmp/old"]
-+        detector = file_drag_mac.DragDetector(read)
++        revision = mock.Mock(side_effect=[1, 2, 2])
++        detector = file_drag_mac.DragDetector(read, revision)
++        detector.arm()
 +        self.assertEqual(detector.update(True), ())
 +        self.assertTrue(began.wait(1))
 +        detector.update(False)
 +        continue_read.set()
 +        self.assertEqual(detector.update(False), ())
++        self.assertEqual(detector._paths, ())
++
++    def test_previous_drag_is_not_read_before_revision_changes(self):
++        revision = mock.Mock(return_value=42)
++        read = mock.Mock(return_value=["/tmp/old"])
++        detector = file_drag_mac.DragDetector(read, revision)
++        detector.arm()
++        self.assertEqual(detector.update(True), ())
++        read.assert_not_called()
++
++    def test_new_drag_becomes_available_only_after_stable_revision(self):
++        revision = mock.Mock(return_value=4)
++        finished = threading.Event()
++        def read():
++            finished.set()
++            return ["/tmp/new"]
++        detector = file_drag_mac.DragDetector(read, revision)
++        detector.arm()
++        revision.return_value = 5
++        detector.update(True)
++        self.assertTrue(finished.wait(1))
++        for _ in range(100):
++            if detector._paths:
++                break
++            threading.Event().wait(.01)
++        self.assertEqual(detector.update(True), ("/tmp/new",))
++        revision.return_value = 6
++        self.assertEqual(detector.update(True), ())
++
++    def test_unknown_baseline_never_reads_stale_data(self):
++        read = mock.Mock(return_value=["/tmp/old"])
++        detector = file_drag_mac.DragDetector(read, lambda: None)
++        detector.arm()
++        self.assertEqual(detector.update(True), ())
++        read.assert_not_called()
++
++    def test_revision_change_during_read_discards_result(self):
++        revision = mock.Mock(return_value=1)
++        started, finish = threading.Event(), threading.Event()
++        def read():
++            started.set()
++            finish.wait(1)
++            return ["/tmp/stale"]
++        detector = file_drag_mac.DragDetector(read, revision)
++        detector.arm()
++        revision.return_value = 2
++        detector.update(True)
++        self.assertTrue(started.wait(1))
++        revision.return_value = 3
++        finish.set()
++        for _ in range(100):
++            if not detector._reading:
++                break
++            threading.Event().wait(.01)
 +        self.assertEqual(detector._paths, ())
 +
 +

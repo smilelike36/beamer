@@ -1,0 +1,1413 @@
+From 8f428cf94358f2497bbf1fc7d41367a88e1de9c5 Mon Sep 17 00:00:00 2001
+From: smilelike36 <89850871+smilelike36@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:07:04 +0300
+Subject: [PATCH] Synchronise Russian and English keyboard layouts
+
+Signed-off-by: smilelike36 <89850871+smilelike36@users.noreply.github.com>
+---
+ core/keyboard_sync.py                   |  95 ++++++++++++++++
+ core/protocol.py                        |  16 ++-
+ core/receiver.py                        |  36 +++++++
+ core/tests/test_keyboard_sync.py        | 134 +++++++++++++++++++++++
+ locales/beamer.pot                      |  17 +++
+ locales/it.po                           |  17 +++
+ mac_app/bridge.py                       |  50 ++++++++-
+ mac_app/config.py                       |   2 +
+ mac_app/fn_language.py                  |  55 ++++++++++
+ mac_app/input_injector_mac.py           |   4 +
+ mac_app/keyboard_layout.py              |  96 ++++++++++++++++-
+ mac_app/kvm_bridge_app.py               |   5 +
+ mac_app/settings_store.py               |   1 +
+ mac_app/tests/test_fn_language.py       | 138 ++++++++++++++++++++++++
+ mac_app/tests/test_keyboard_sync_mac.py |  30 ++++++
+ mac_app/windows_input.py                |   1 +
+ win_app/app_config.py                   |   3 +
+ win_app/input_injector.py               |  17 +--
+ win_app/keyboard_language.py            |  68 ++++++++++++
+ win_app/kvm_bridge_win.py               |  18 +++-
+ win_app/sender.py                       |  11 ++
+ win_app/tests/test_keyboard_language.py |  61 +++++++++++
+ 22 files changed, 864 insertions(+), 11 deletions(-)
+ create mode 100644 core/keyboard_sync.py
+ create mode 100644 core/tests/test_keyboard_sync.py
+ create mode 100644 mac_app/fn_language.py
+ create mode 100644 mac_app/tests/test_fn_language.py
+ create mode 100644 mac_app/tests/test_keyboard_sync_mac.py
+ create mode 100644 win_app/keyboard_language.py
+ create mode 100644 win_app/tests/test_keyboard_language.py
+
+diff --git a/core/keyboard_sync.py b/core/keyboard_sync.py
+new file mode 100644
+index 0000000..d5a4ae2
+--- /dev/null
++++ b/core/keyboard_sync.py
+@@ -0,0 +1,95 @@
++"""Opt-in RU/EN input-source synchronisation, independent of UI translation.
++
++Only peers advertising input_language receive the extension. No native layout IDs
++cross the network: each endpoint chooses from its own installed input sources.
++"""
++
++LANGUAGES = frozenset({"ru", "en"})
++CAPABILITY = "input_language"
++MESSAGE = "input_language"
++
++
++class Shortcut:
++    """Buffer a bare Alt+Shift chord so neither OS toggles a second time.
++
++    Any other key or mouse action flushes the modifiers unchanged. AltGr+Shift
++    typing and Alt+mouse gestures therefore keep their ordinary behaviour.
++    """
++
++    def __init__(self):
++        self.held = set()
++        self.pending = []
++        self.chord = False
++        self.used = False
++        self.other = set()
++
++    def feed(self, message):
++        kind, data = message.get("type"), message.get("data", {})
++        key = data.get("key")
++        modifier = key in {"alt", "alt_r", "shift", "shift_r"}
++        if kind == "keydown" and not modifier:
++            self.other.add(key)
++        elif kind == "keyup" and not modifier:
++            self.other.discard(key)
++        if kind not in {"keydown", "keyup"} or not modifier:
++            self.used = bool(self.held)
++            self.chord = False
++            result, self.pending = self.pending + [message], []
++            return result, False
++        if kind == "keydown":
++            self.held.add(key)
++        else:
++            self.held.discard(key)
++        if self.used or self.other:
++            result, self.pending = self.pending + [message], []
++            self.chord = False
++            if not self.held:
++                self.used = False
++            return result, False
++        self.pending.append(message)
++        self.chord |= (bool(self.held & {"alt", "alt_r"})
++                       and bool(self.held & {"shift", "shift_r"}))
++        if self.held:
++            return [], False
++        result = self.pending
++        toggle = self.chord
++        self.pending, self.chord = [], False
++        return result, toggle
++
++
++class Outbound:
++    def __init__(self, backend):
++        self.backend = backend
++        self.shortcuts = {}
++
++    def forget(self, peer):
++        self.shortcuts.pop(peer, None)
++
++    def toggle_language(self):
++        """Select the other local RU/EN source and return its wire command."""
++        current = self.backend.current_language()
++        desired = "en" if current == "ru" else "ru" if current == "en" else None
++        if desired and self.backend.select_language(desired):
++            return {"type": MESSAGE, "data": {"language": desired}}
++        return None
++
++    def messages(self, peer, message, *, enabled, caps):
++        if not enabled or CAPABILITY not in caps:
++            self.forget(peer)
++            return [message]
++        if message.get("type") in {"keydown", "keyup", "mousemove", "mousedown", "mouseup", "scroll"}:
++            messages, toggle = self.shortcuts.setdefault(peer, Shortcut()).feed(message)
++            if toggle:
++                changed = self.toggle_language()
++                if changed:
++                    return [changed]
++                # No matching installed input source: preserve the original chord.
++                return messages
++        else:
++            messages = [message]
++        language = self.backend.current_language()
++        if language not in LANGUAGES:
++            return messages
++        return [dict(part, data=dict(part.get("data", {}), input_language=language))
++                if part.get("type") in {"focus", "keydown", "keyup"} else part
++                for part in messages]
+diff --git a/core/protocol.py b/core/protocol.py
+index 91050d4..8d9df00 100644
+--- a/core/protocol.py
++++ b/core/protocol.py
+@@ -425,8 +425,9 @@ MSG_ACCEPT = "accept"
+ MSG_REFUSE = "refuse"
+ MSG_ACCEPTS = "accepts"
+ MSG_PAIRED = "paired"
++MSG_INPUT_LANGUAGE = "input_language"
+ MSG_TEXT = "text"
+-INPUT_TYPES = frozenset({MSG_KEYDOWN, MSG_KEYUP, MSG_MOUSEMOVE, MSG_MOUSEDOWN, MSG_MOUSEUP, MSG_SCROLL, MSG_GESTURE, MSG_TEXT})
++INPUT_TYPES = frozenset({MSG_KEYDOWN, MSG_KEYUP, MSG_MOUSEMOVE, MSG_MOUSEDOWN, MSG_MOUSEUP, MSG_SCROLL, MSG_GESTURE, MSG_TEXT, MSG_INPUT_LANGUAGE})
+ 
+ ERROR_INVALID_HELLO = "invalid_hello"
+ ERROR_WRONG_ID = "wrong_id"
+@@ -1043,6 +1044,11 @@ def read_focus(message, own_id: bytes):
+             malformed = True
+         else:
+             focus["reach"] = reach
++    if "input_language" in data:
++        if data["input_language"] in ("en", "ru"):
++            focus["input_language"] = data["input_language"]
++        else:
++            malformed = True
+     focus["malformed"] = malformed
+     return focus
+ 
+@@ -1226,11 +1232,19 @@ def read_input(message):
+     if not _int(seq, 1, MAX_SAFE_INTEGER):
+         return None
+     read = {"type": kind, "seq": seq}
++    if "input_language" in data:
++        if data["input_language"] not in ("en", "ru"):
++            return None
++        read["input_language"] = data["input_language"]
+     if kind in (MSG_KEYDOWN, MSG_KEYUP):
+         us = data.get("us")
+         if not _text(data.get("key"), 1, MAX_KEY_CHARS) or ("us" in data and not _text(us, 1, 1)):
+             return None
+         read.update(key=data["key"], us=us if "us" in data else None)
++    elif kind == MSG_INPUT_LANGUAGE:
++        if data.get("language") not in ("en", "ru"):
++            return None
++        read["input_language"] = data["language"]
+     elif kind == MSG_MOUSEMOVE:
+         if not _int(data.get("dx"), -MOVE_MAX, MOVE_MAX) or not _int(data.get("dy"), -MOVE_MAX, MOVE_MAX):
+             return None
+diff --git a/core/receiver.py b/core/receiver.py
+index 21e3982..7826abc 100644
+--- a/core/receiver.py
++++ b/core/receiver.py
+@@ -568,6 +568,9 @@ class LinkResponder:
+         # This machine's speed for a peer's pointer and scroll, and whether
+         # its edges are held (Pause crossing, a full-screen app), which keeps the zones from firing.
+         self.input_scale: Optional[InputScale] = None
++        self.keyboard_sync = False
++        self._keyboard_sync_failed = {}
++        self._keyboard_sync_notice_at = float("-inf")
+         self.edges_held: Callable[[], bool] = lambda: False
+         # One lock for the links, the owner and everything the owner decides. Held while the owner's
+         # input is injected, so an ownership ending on another thread cannot release keys between
+@@ -1292,6 +1295,8 @@ class LinkResponder:
+     def _takes(self, link: _Link, read: dict) -> bool:
+         """Whether this machine acts on this input at all: a message its capabilities do not cover
+         is dropped, and still acknowledged (section 2)."""
++        if read["type"] == protocol.MSG_INPUT_LANGUAGE:
++            return self.keyboard_sync and "input_language" in link.own_caps and "input_language" in link.caps
+         if read["type"] == protocol.MSG_TEXT:
+             return read["text"] is not None and "text" in link.own_caps and hasattr(self._injector_module(), "inject_text")
+         if read["type"] == protocol.MSG_GESTURE:
+@@ -1301,6 +1306,12 @@ class LinkResponder:
+     def _inject_locked(self, link: _Link, read: dict, *, scaled=False) -> None:
+         injector = self._injector_module()
+         kind = read["type"]
++        if self.keyboard_sync and "input_language" in link.caps and "input_language" in link.own_caps:
++            language = read.get("input_language")
++            if language is not None:
++                self._sync_keyboard_language(language)
++        if kind == protocol.MSG_INPUT_LANGUAGE:
++            return
+         if kind in (protocol.MSG_KEYDOWN, protocol.MSG_KEYUP):
+             down = kind == protocol.MSG_KEYDOWN
+             if down:
+@@ -1566,11 +1577,36 @@ class LinkResponder:
+                 # The answer goes before the pointer is placed or anything plays.
+                 link.post(protocol.accept_msg(focus["route"]))
+                 after += self._own_locked(link, focus, peers, zones)
++                if self.keyboard_sync and "input_language" in link.caps and "input_language" in link.own_caps:
++                    language = focus.get("input_language")
++                    if language is not None:
++                        self._sync_keyboard_language(language)
+             stale = focus["here"] and generation != self._generation
+         self._run(after)
+         if stale:
+             self._rearm_fresh()
+ 
++    def _sync_keyboard_language(self, language):
++        now = time.monotonic()
++        if now - self._keyboard_sync_failed.get(language, float("-inf")) < 5:
++            return False
++        try:
++            selected = getattr(self._injector_module(), "sync_keyboard_language", lambda language: False)(language)
++        except Exception:
++            LOGGER.exception("Could not synchronise the keyboard input language")
++            selected = False
++        if selected:
++            self._keyboard_sync_failed.pop(language, None)
++            return True
++        # A missing layout or an app refusing changes must not stall every key.
++        self._keyboard_sync_failed[language] = now
++        if now - self._keyboard_sync_notice_at >= 30:
++            self._keyboard_sync_notice_at = now
++            self._set_status(ServerState.CONNECTED, tr(
++                "Could not select the {language} keyboard layout. Enable it in your operating system or select it manually."
++            ).format(language=language.upper()))
++        return False
++
+     def _refusal_locked(self, link: _Link, focus: dict):
+         """Section 4's decision order, after the stale route (steps 2 to 7). The take is made
+         visible (`driven`) before `away()` is read, and stays so until it is refused or becomes
+diff --git a/core/tests/test_keyboard_sync.py b/core/tests/test_keyboard_sync.py
+new file mode 100644
+index 0000000..a1d82c2
+--- /dev/null
++++ b/core/tests/test_keyboard_sync.py
+@@ -0,0 +1,134 @@
++import unittest
++from unittest import mock
++
++from core import keyboard_sync, protocol
++from core.tests.responder_harness import B, C, HERE, Initiator, Machine, entry
++
++
++def key(name, down=True):
++    return {"type": "keydown" if down else "keyup", "data": {"key": name}}
++
++
++class RoutingTests(unittest.TestCase):
++    def setUp(self):
++        self.language = "ru"
++        self.backend = mock.Mock()
++        self.backend.current_language.side_effect = lambda: self.language
++        self.backend.select_language.side_effect = self.select
++        self.sender = keyboard_sync.Outbound(self.backend)
++
++    def select(self, language):
++        self.language = language
++        return True
++
++    def send(self, message, **kwargs):
++        return self.sender.messages(B, message, enabled=kwargs.get("enabled", True),
++                                    caps=kwargs.get("caps", {"input_language"}))
++
++    def test_opt_in_and_peer_capability_are_both_required(self):
++        message = key("ю")
++        for options in ({"enabled": False}, {"caps": set()}):
++            self.assertEqual(self.send(message, **options), [message])
++        self.backend.current_language.assert_not_called()
++
++    def test_language_goes_with_focus_and_typing_without_changing_the_original(self):
++        focus = protocol.focus_v6(1, HERE)
++        for message in (focus, key("ю"), key("ю", False)):
++            self.assertEqual(self.send(message)[0]["data"]["input_language"], "ru")
++            self.assertNotIn("input_language", message["data"])
++
++    def test_bare_alt_shift_is_one_language_change_and_no_remote_modifiers(self):
++        result = []
++        for message in (key("alt"), key("shift"), key("shift", False), key("alt", False)):
++            result += self.send(message)
++        self.assertEqual(result, [{"type": "input_language", "data": {"language": "en"}}])
++        self.backend.select_language.assert_called_once_with("en")
++        self.assertEqual(self.send(key("a"))[0]["data"]["input_language"], "en")
++
++    def test_altgr_shift_typing_alt_tab_ctrl_alt_shift_and_mouse_keep_their_events(self):
++        cases = [
++            [key("alt_r"), key("shift"), key("@"), key("@", False), key("shift", False), key("alt_r", False)],
++            [key("alt"), key("tab"), key("tab", False), key("alt", False)],
++            [key("ctrl"), key("alt"), key("shift"), key("shift", False), key("alt", False), key("ctrl", False)],
++            [key("alt"), {"type": "mousedown", "data": {"button": "left"}}, key("alt", False)],
++        ]
++        for messages in cases:
++            with self.subTest(messages=messages):
++                self.sender.forget(B)
++                result = [part for message in messages for part in self.send(message)]
++                for part in result:
++                    part["data"].pop("input_language", None)
++                self.assertEqual(result, messages)
++        self.backend.select_language.assert_not_called()
++
++    def test_missing_layout_preserves_the_original_chord(self):
++        self.backend.select_language.side_effect = lambda language: False
++        messages = [key("alt"), key("shift"), key("alt", False), key("shift", False)]
++        self.assertEqual([part for message in messages for part in self.send(message)], messages)
++
++    def test_disconnection_discards_buffered_modifiers(self):
++        self.assertEqual(self.send(key("alt")), [])
++        self.sender.forget(B)
++        self.assertEqual(len(self.send(key("a"))), 1)
++
++
++class ProtocolTests(unittest.TestCase):
++    def test_language_extension_is_validated(self):
++        message = key("ю")
++        message["data"].update(seq=1, input_language="ru")
++        self.assertEqual(protocol.read_input(message)["input_language"], "ru")
++        for invalid in (None, [], {}, True, "xx", "ru-RU"):
++            message["data"]["input_language"] = invalid
++            self.assertIsNone(protocol.read_input(message))
++
++    def test_explicit_language_event_is_acknowledgeable_input(self):
++        message = {"type": "input_language", "data": {"language": "en", "seq": 2}}
++        self.assertEqual(protocol.read_input(message), {"type": "input_language", "seq": 2, "input_language": "en"})
++
++    def test_let_go_ignores_language_but_take_validates_it(self):
++        message = protocol.focus_v6(1, HERE)
++        message["data"]["input_language"] = "ru"
++        self.assertEqual(protocol.read_focus(message, HERE)["input_language"], "ru")
++        message["data"]["input_language"] = "invalid"
++        self.assertTrue(protocol.read_focus(message, HERE)["malformed"])
++        self.assertNotIn("input_language", protocol.read_focus(message, B))
++
++
++class ReceiverTests(unittest.TestCase):
++    def test_only_the_current_owner_can_change_the_layout_and_disabled_receivers_ignore_it(self):
++        machine = Machine([entry(B, "Bee"), entry(C, "Sea")], caps={"input_language"}).start()
++        self.addCleanup(machine.stop)
++        changed = []
++        machine.injector.sync_keyboard_language = lambda language: (changed.append(language), True)[1]
++        owner = Initiator(machine, B)
++        self.addCleanup(owner.close)
++        owner.handshake(owner.hello(caps=["input_language"]))
++        other = Initiator(machine, C)
++        self.addCleanup(other.close)
++        other.handshake(other.hello(caps=["input_language"]))
++        self.assertEqual(owner.answer(owner.take())[0], protocol.MSG_ACCEPT)
++        event = {"type": "input_language", "data": {"language": "ru"}}
++        self.assertIsNotNone(owner.acked(owner.input(event)))
++        self.assertEqual(changed, [])
++        machine.responder.keyboard_sync = True
++        self.assertIsNotNone(other.acked(other.input(event)))
++        self.assertEqual(changed, [])
++        self.assertIsNotNone(owner.acked(owner.input(event)))
++        self.assertEqual(changed, ["ru"])
++        message = key("ю")
++        message["data"]["input_language"] = "ru"
++        self.assertIsNotNone(owner.acked(owner.input(message)))
++        self.assertEqual(changed, ["ru", "ru"])
++        self.assertIn(("key", "ю", True), machine.injected())
++
++    def test_a_missing_layout_or_native_failure_does_not_retry_on_every_key(self):
++        machine = Machine([entry(B, "Bee")])
++        machine.injector.sync_keyboard_language = mock.Mock(side_effect=OSError("unavailable"))
++        with self.assertLogs("core.receiver", level="ERROR"):
++            self.assertFalse(machine.responder._sync_keyboard_language("ru"))
++        self.assertFalse(machine.responder._sync_keyboard_language("ru"))
++        machine.injector.sync_keyboard_language.assert_called_once_with("ru")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/locales/beamer.pot b/locales/beamer.pot
+index f9d6018..15c10a3 100644
+--- a/locales/beamer.pot
++++ b/locales/beamer.pot
+@@ -837,6 +837,11 @@ msgstr ""
+ msgid "Input error from {name}; see log"
+ msgstr ""
+ 
++#: core/receiver.py
++#, python-brace-format
++msgid "Could not select the {language} keyboard layout. Enable it in your operating system or select it manually."
++msgstr ""
++
+ #: core/receiver.py
+ #, python-brace-format
+ msgid "Connected to {names}"
+@@ -1673,6 +1678,10 @@ msgstr ""
+ msgid "Mouse only"
+ msgstr ""
+ 
++#: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
++msgid "Synchronise Russian and English keyboard layouts"
++msgstr ""
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Reverse other machines' scrolling"
+ msgstr ""
+@@ -2276,6 +2285,10 @@ msgstr ""
+ msgid "Keep this machine's keyboard here. Pointer and clipboard sharing stay on."
+ msgstr ""
+ 
++#: mac_app/kvm_bridge_app.py
++msgid "Enable on both computers. A bare Fn tap on this Mac switches RU/EN while controlling Windows. Alt+Shift also works."
++msgstr ""
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Pointer speed for another machine's mouse or trackpad while it drives this Mac."
+ msgstr ""
+@@ -4667,6 +4680,10 @@ msgstr ""
+ msgid "For the trackpad or mouse of whichever machine drives this PC."
+ msgstr ""
+ 
++#: win_app/kvm_bridge_win.py
++msgid "Enable on both computers. Alt+Shift switches RU/EN while controlling another computer."
++msgstr ""
++
+ #: win_app/kvm_bridge_win.py
+ msgid "That could not be saved, so the list is unchanged."
+ msgstr ""
+diff --git a/locales/it.po b/locales/it.po
+index b764b06..a8fba93 100644
+--- a/locales/it.po
++++ b/locales/it.po
+@@ -839,6 +839,11 @@ msgstr "Avvio sulla porta {port}"
+ msgid "Input error from {name}; see log"
+ msgstr "Errore di input da {name}; vedi il registro"
+ 
++#: core/receiver.py
++#, python-brace-format
++msgid "Could not select the {language} keyboard layout. Enable it in your operating system or select it manually."
++msgstr "Impossibile selezionare il layout {language}. Abilitalo nelle impostazioni del sistema o selezionalo manualmente."
++
+ #: core/receiver.py
+ #, python-brace-format
+ msgid "Connected to {names}"
+@@ -1682,6 +1687,10 @@ msgstr "Scarica"
+ msgid "Mouse only"
+ msgstr "Solo mouse"
+ 
++#: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
++msgid "Synchronise Russian and English keyboard layouts"
++msgstr "Sincronizza i layout di tastiera russo e inglese"
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Reverse other machines' scrolling"
+ msgstr "Inverti lo scorrimento degli altri computer"
+@@ -2319,6 +2328,10 @@ msgstr "Sistema segue l'impostazione chiara o scura del Mac."
+ msgid "Keep this machine's keyboard here. Pointer and clipboard sharing stay on."
+ msgstr "Mantieni la tastiera su questo computer. Il puntatore e gli appunti restano condivisi."
+ 
++#: mac_app/kvm_bridge_app.py
++msgid "Enable on both computers. A bare Fn tap on this Mac switches RU/EN while controlling Windows. Alt+Shift also works."
++msgstr "Attiva su entrambi i computer. Una pressione del solo tasto Fn su questo Mac cambia RU/EN durante il controllo di Windows. Funziona anche Alt+Shift."
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Pointer speed for another machine's mouse or trackpad while it drives this Mac."
+ msgstr "Velocità del puntatore per il mouse o il trackpad di un altro computer mentre controlla questo Mac."
+@@ -4743,6 +4756,10 @@ msgstr "Segue il mouse o il trackpad di questo PC su ogni schermo; ogni schermo
+ msgid "For the trackpad or mouse of whichever machine drives this PC."
+ msgstr "Per il trackpad o il mouse del computer che controlla questo PC."
+ 
++#: win_app/kvm_bridge_win.py
++msgid "Enable on both computers. Alt+Shift switches RU/EN while controlling another computer."
++msgstr "Attiva su entrambi i computer. Alt+Maiusc alterna RU/EN durante il controllo di un altro computer."
++
+ #: win_app/kvm_bridge_win.py
+ msgid "That could not be saved, so the list is unchanged."
+ msgstr "Impossibile salvarlo, quindi l'elenco è invariato."
+diff --git a/mac_app/bridge.py b/mac_app/bridge.py
+index c2988f2..5c6c5b5 100644
+--- a/mac_app/bridge.py
++++ b/mac_app/bridge.py
+@@ -33,7 +33,9 @@ from core import effects
+ from core import identify_screens
+ import frame_clock
+ import keyboard_layout
++import fn_language
+ import media_keys
++from core import keyboard_sync
+ from core import keytable
+ from core import link as link_module
+ from core import owner as owner_module
+@@ -80,7 +82,7 @@ ROUND_TRIP_MAX_AGE_SECONDS = 5.0
+ # the ownership by force after one second), then goes ahead.
+ LET_GO_WAIT_SECONDS = 1.3
+ OWN_PLATFORM = "macos"
+-CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path")
++CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language")
+ MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"})
+ 
+ # Why input came home, in words, for the alert. A why that is not here comes home quietly.
+@@ -634,6 +636,8 @@ class KVMController:
+         self.tap_run_loop = None
+         self.tap_callback_ref = self._event_tap_callback
+         self.translator = QuartzEventTranslator(quartz)
++        self._keyboard_sync = keyboard_sync.Outbound(keyboard_layout)
++        self._fn_language = fn_language.FnTap(quartz)
+         self._sent_names = {}
+         self.trigger_code = KEY_NAME_TO_CODE[cfg.trigger_key]
+         self._jump_swallowed = set()
+@@ -1738,6 +1742,14 @@ class KVMController:
+                 self._shake_input_event(event_type, event)
+             if not self._was_injected(event) and self._handle_jump_key(event_type, event):
+                 return None
++            if not self._was_injected(event):
++                consume_fn, toggle_fn = self._fn_language.feed(
++                    event_type, event, enabled=self._fn_sync_target())
++                if toggle_fn:
++                    self.outbound.put_nowait({"type": fn_language.TOGGLE,
++                                             "target": self._fn_sync_target()})
++                if consume_fn:
++                    return None
+             if self.receiving:
+                 # The PC is driving this Mac over the other link. Everything
+                 # passes through untouched: crossing must not read a pointer
+@@ -2738,6 +2750,8 @@ class KVMController:
+             link.drop(owner_module.DROPPED)
+ 
+     def _forget_held(self, peer):
++        if hasattr(self, "_keyboard_sync"):
++            self._keyboard_sync.forget(peer)
+         """`peer`'s link is lost: what waited for its clipboard is for a link that is gone."""
+         with self._clip_lock:
+             self._clip_wait.pop(peer, None)
+@@ -2746,6 +2760,17 @@ class KVMController:
+                 self._sent_names.pop(held, None)
+ 
+     def _send(self, send):
++        if not getattr(self.cfg, "keyboard_sync", False):
++            self._send_part(send)
++            return
++        link = self._peers_up.get(send.peer)
++        if link is None:
++            return
++        for message in self._keyboard_sync.messages(send.peer, send.message,
++                enabled=getattr(self.cfg, "keyboard_sync", False), caps=link.caps):
++            self._send_part(owner_module.Send(send.peer, message))
++
++    def _send_part(self, send):
+         link = self._peers_up.get(send.peer)
+         if link is None:
+             return
+@@ -3050,6 +3075,15 @@ class KVMController:
+         """Handle one dequeued item: input the tap captured, which the owner routes (to the machine
+         it is on, held for a hand-over, or dropped when it has already come home)."""
+         kind = message.get("type")
++        if kind == fn_language.TOGGLE:
++            target = message.get("target")
++            if not target or target != self._fn_sync_target():
++                return
++            changed = self._keyboard_sync.toggle_language()
++            if changed and target == self._fn_sync_target():
++                self._step(lambda owner: owner.input(changed))
++                self.logger.info("Fn selected input language %s for Windows", changed["data"]["language"])
++            return
+         if kind in (protocol.MSG_KEYUP, protocol.MSG_MOUSEUP):
+             # Whether or not the input is away: the release of a key pressed there that arrives
+             # after it came home is what lets the owner stop swallowing it.
+@@ -3065,6 +3099,20 @@ class KVMController:
+ 
+         self._step(route)
+ 
++    def _fn_sync_target(self):
++        """Fn changes language only while this Mac drives a capable Windows peer."""
++        if (not self.redirecting or self.receiving or not self.owner.away
++                or not getattr(self.cfg, "keyboard_sync", False)
++                or self.cfg.mouse_only
++                or ignored.key(fn_language.FN_CODE) in self.cfg.ignored_inputs):
++            return None
++        peer = self.owner.on
++        link = self._peers_up.get(peer)
++        if (link is None or link.peer_platform != "windows"
++                or keyboard_sync.CAPABILITY not in link.caps):
++            return None
++        return peer, self.owner._visit_route
++
+     def _repair_redirecting_disagreement(self):
+         """The tap is about to swallow input as redirected while the owner says it is home. Starts
+         one repair and nothing else: the tap thread never logs, formats a stack or takes the owner's
+diff --git a/mac_app/config.py b/mac_app/config.py
+index 8382f66..17abcba 100644
+--- a/mac_app/config.py
++++ b/mac_app/config.py
+@@ -78,6 +78,7 @@ class Config:
+     # Every address the window shows is hidden; see pages.redact.
+     hide_addresses: bool = False
+     language: str = "auto"
++    keyboard_sync: bool = False
+     # Only the machine in use shows a pointer: this Mac's after a driver lets go of it, until it
+     # moves (core/idle_pointer). Its pointer always hides while it drives. This Mac's own choice.
+     hide_idle_pointer: bool = True
+@@ -222,6 +223,7 @@ def parse_config(raw: dict) -> Config:
+         reverse_scroll=raw.get("reverse_scroll", False),
+         appearance=raw.get("appearance") if raw.get("appearance") in APPEARANCES else "system",
+         language=raw.get("language") if raw.get("language") in ("auto", "en", "it") else "auto",
++        keyboard_sync=raw.get("keyboard_sync") is True,
+         ignored_inputs=raw.get("ignored_inputs", []),
+         mouse_only=raw.get("mouse_only", False),
+     )
+diff --git a/mac_app/fn_language.py b/mac_app/fn_language.py
+new file mode 100644
+index 0000000..654c01f
+--- /dev/null
++++ b/mac_app/fn_language.py
+@@ -0,0 +1,55 @@
++"""Recognise a physical, bare Fn tap without changing Fn combinations.
++
++Only keycode 63 identifies Fn itself. The secondary-Fn flag also accompanies
++arrow and function keys, so the flag on its own must never start a tap.
++"""
++
++FN_CODE = 0x3F
++FN_FLAG = 1 << 23
++TOGGLE = "_toggle_input_language"  # Local queue item, never sent on the wire.
++CHORD_FLAGS = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
++
++
++class FnTap:
++    def __init__(self, quartz):
++        self.quartz = quartz
++        self.pressed = set()
++        self.held = False
++        self.captured = False
++        self.used = False
++
++    def feed(self, event_type, event, *, enabled):
++        """Return (consume Fn event, toggle on release).
++
++        A press starting locally cannot toggle after crossing to Windows. A
++        captured press ending locally is swallowed but cannot toggle either.
++        """
++        q = self.quartz
++        if event_type not in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
++            if self.held and event_type not in (
++                    q.kCGEventMouseMoved, q.kCGEventLeftMouseDragged,
++                    q.kCGEventRightMouseDragged, q.kCGEventOtherMouseDragged):
++                self.used = True
++            return False, False
++        code = int(q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode))
++        flags = int(q.CGEventGetFlags(event))
++        if code != FN_CODE:
++            if event_type == q.kCGEventKeyDown:
++                self.pressed.add(code)
++            elif event_type == q.kCGEventKeyUp:
++                self.pressed.discard(code)
++            # Other modifiers, arrows and function keys make this a chord.
++            if self.held:
++                self.used = True
++            return False, False
++        down = bool(flags & FN_FLAG) if event_type == q.kCGEventFlagsChanged else event_type == q.kCGEventKeyDown
++        if down:
++            if not self.held:
++                self.held = True
++                self.captured = enabled
++                self.used = bool(self.pressed or flags & CHORD_FLAGS)
++            return bool(self.captured), False
++        consume = self.held and self.captured
++        toggle = consume and enabled == self.captured and not self.used and not (flags & CHORD_FLAGS)
++        self.held = self.captured = self.used = False
++        return bool(consume), bool(toggle)
+diff --git a/mac_app/input_injector_mac.py b/mac_app/input_injector_mac.py
+index 1c0158c..ffd0f47 100644
+--- a/mac_app/input_injector_mac.py
++++ b/mac_app/input_injector_mac.py
+@@ -27,6 +27,10 @@ import unicodedata
+ from typing import Dict, List, Optional, Set, Tuple
+ 
+ import keyboard_layout
++
++def sync_keyboard_language(language):
++    return keyboard_layout.select_language(language)
++
+ from key_codes import KEY_NAME_TO_CODE, US_KEY_CODES
+ 
+ try:
+diff --git a/mac_app/keyboard_layout.py b/mac_app/keyboard_layout.py
+index 22186e9..a1b04ad 100644
+--- a/mac_app/keyboard_layout.py
++++ b/mac_app/keyboard_layout.py
+@@ -20,6 +20,7 @@ readers only ever look up.
+ import ctypes
+ import ctypes.util
+ import logging
++import threading
+ from typing import Dict, Optional
+ 
+ from key_codes import PRINTABLE_KEY_FALLBACKS
+@@ -37,6 +38,7 @@ _K_UC_KEY_TRANSLATE_NO_DEAD_KEYS = 1
+ 
+ _chars: Dict[int, Optional[str]] = dict(PRINTABLE_KEY_FALLBACKS)
+ _codes: Dict[str, int] = {}
++_language = None
+ for _code, _char in sorted(PRINTABLE_KEY_FALLBACKS.items()):
+     _codes.setdefault(_char, _code)
+ 
+@@ -76,6 +78,11 @@ class _Carbon:
+         self.carbon = carbon
+         self.core = core
+         carbon.TISCopyCurrentKeyboardLayoutInputSource.restype = ctypes.c_void_p
++        carbon.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
++        carbon.TISCreateInputSourceList.argtypes = [ctypes.c_void_p, ctypes.c_bool]
++        carbon.TISCreateInputSourceList.restype = ctypes.c_void_p
++        carbon.TISSelectInputSource.argtypes = [ctypes.c_void_p]
++        carbon.TISSelectInputSource.restype = ctypes.c_int32
+         carbon.TISGetInputSourceProperty.restype = ctypes.c_void_p
+         carbon.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+         carbon.LMGetKbdType.restype = ctypes.c_uint8
+@@ -137,10 +144,11 @@ _carbon = None
+ def refresh() -> bool:
+     """Main thread only. Re-reads the current layout into the table; on any failure the table
+     keeps what it had, and the US answers stay underneath."""
+-    global _carbon
++    global _carbon, _language
+     try:
+         if _carbon is None:
+             _carbon = _Carbon()
++        _language = _read_language()
+         chars = _carbon.current_chars()
+     except Exception:
+         LOGGER.exception("could not read the keyboard layout; keys follow US positions")
+@@ -152,6 +160,92 @@ def refresh() -> bool:
+     return True
+ 
+ 
++def _source_property(source, key):
++    import objc
++    pointer = _carbon.carbon.TISGetInputSourceProperty(
++        source, ctypes.c_void_p.in_dll(_carbon.carbon, key).value)
++    return objc.objc_object(c_void_p=pointer) if pointer else None
++
++
++def _source_language(source):
++    languages = _source_property(source, "kTISPropertyInputSourceLanguages") or ()
++    for code in languages:
++        base = str(code).replace("_", "-").split("-")[0].lower()
++        if base in {"en", "ru"}:
++            return base
++    return None
++
++
++def _read_language():
++    source = _carbon.carbon.TISCopyCurrentKeyboardInputSource()
++    if not source:
++        return None
++    try:
++        return _source_language(source)
++    finally:
++        _carbon.core.CFRelease(source)
++
++
++def current_language():
++    """Cached by the main-thread observer; safe on the event-tap and link threads."""
++    return _language
++
++
++def _select_language(language):
++    import objc
++    if _carbon is None:
++        refresh()
++    if _read_language() == language:
++        return True
++    pointer = _carbon.carbon.TISCreateInputSourceList(None, False)
++    if not pointer:
++        return False
++    try:
++        for source in objc.objc_object(c_void_p=pointer):
++            address = objc.pyobjc_id(source)
++            if (bool(_source_property(address, "kTISPropertyInputSourceIsEnabled"))
++                    and bool(_source_property(address, "kTISPropertyInputSourceIsSelectCapable"))
++                    and _source_language(address) == language):
++                if _carbon.carbon.TISSelectInputSource(address) == 0:
++                    refresh()
++                    return current_language() == language
++    finally:
++        _carbon.core.CFRelease(pointer)
++    LOGGER.warning("No enabled keyboard input source for %s; leaving the active source unchanged", language)
++    return False
++
++
++def select_language(language):
++    """TIS APIs run on the main thread; a timed-out queued change is cancelled."""
++    if language not in {"en", "ru"}:
++        return False
++    if threading.current_thread() is threading.main_thread():
++        return _select_language(language)
++    if current_language() == language:
++        return True
++    from PyObjCTools import AppHelper
++    done = threading.Event()
++    cancelled = threading.Event()
++    result = []
++
++    def apply():
++        if cancelled.is_set():
++            return
++        try:
++            result.append(_select_language(language))
++        except Exception:
++            LOGGER.exception("Could not select the keyboard input source")
++        finally:
++            done.set()
++
++    AppHelper.callAfter(apply)
++    if not done.wait(0.5):
++        cancelled.set()
++        LOGGER.warning("Timed out waiting for the keyboard input-source change")
++        return False
++    return bool(result and result[0])
++
++
+ try:
+     import Foundation
+ except ImportError:  # pragma: no cover - off macOS
+diff --git a/mac_app/kvm_bridge_app.py b/mac_app/kvm_bridge_app.py
+index 6b5fd89..49ea3f8 100644
+--- a/mac_app/kvm_bridge_app.py
++++ b/mac_app/kvm_bridge_app.py
+@@ -1556,6 +1556,7 @@ class ControlWindow(AppKit.NSObject):
+         self.scroll_numeral.set(str(self.scroll_ruler.value))
+         self.reverse_scroll_box.value = raw["reverse_scroll"]
+         self.mouse_only_box.value = raw["mouse_only"]
++        self.keyboard_sync_box.value = raw["keyboard_sync"]
+         self.appearance_select.value = raw["appearance"]
+         self.language_select.value = raw["language"]
+         self._apply_appearance(raw["appearance"])
+@@ -3246,6 +3247,9 @@ class ControlWindow(AppKit.NSObject):
+         module.add(self.mouse_only_box.view)
+         module.add(widgets.note(tr("Keep this machine's keyboard here. Pointer and clipboard sharing stay on.")).view)
+         widgets.add(body, module.view)
++        self.keyboard_sync_box = widgets.Switch(tr("Synchronise Russian and English keyboard layouts"), on_change=self._changed)
++        module.add(self.keyboard_sync_box.view)
++        module.add(widgets.note(tr("Enable on both computers. A bare Fn tap on this Mac switches RU/EN while controlling Windows. Alt+Shift also works.")).view)
+         widgets.add(body, self._modifier_module().view)
+         widgets.add(body, self._ignored_module().view)
+         widgets.add(body, self._speed_module().view)
+@@ -4628,6 +4632,7 @@ class ControlWindow(AppKit.NSObject):
+             raw["trigger_key"] = self.key_recorder.value
+             raw["ignored_inputs"] = list(self.ignored_entries)
+             raw["mouse_only"] = self.mouse_only_box.value
++            raw["keyboard_sync"] = self.keyboard_sync_box.value
+             raw["trigger_style"] = self.style_select.value
+             raw["double_tap_ms"] = self.double_tap_ruler.value
+             raw["pointer_speed"] = self.pointer_ruler.value / 100
+diff --git a/mac_app/settings_store.py b/mac_app/settings_store.py
+index 8364d2d..c8f2384 100644
+--- a/mac_app/settings_store.py
++++ b/mac_app/settings_store.py
+@@ -158,6 +158,7 @@ def config_to_raw(cfg):
+         "check_updates": cfg.check_updates,
+         "hide_addresses": cfg.hide_addresses,
+         "language": cfg.language,
++        "keyboard_sync": cfg.keyboard_sync,
+         "hide_idle_pointer": cfg.hide_idle_pointer,
+         "same_on_both": cfg.same_on_both,
+         "same_set_at": cfg.same_set_at,
+diff --git a/mac_app/tests/test_fn_language.py b/mac_app/tests/test_fn_language.py
+new file mode 100644
+index 0000000..a4a5b18
+--- /dev/null
++++ b/mac_app/tests/test_fn_language.py
+@@ -0,0 +1,138 @@
++import unittest
++from dataclasses import replace
++from unittest import mock
++
++import bridge
++import fn_language
++from core import protocol
++from bridge_fakes import PAIRED_TOKEN, FakeClock, FakeQuartz as Q, make_config, quiet_logger, redirect_to
++from fake_link import FakeLink, bring_up
++
++
++def fn(down):
++    return {Q.kCGKeyboardEventKeycode: fn_language.FN_CODE,
++            "flags": fn_language.FN_FLAG if down else 0}
++
++
++class FnTapTests(unittest.TestCase):
++    def setUp(self):
++        self.tap = fn_language.FnTap(Q)
++
++    def feed(self, event, enabled=True, kind=Q.kCGEventFlagsChanged):
++        return self.tap.feed(kind, event, enabled=enabled)
++
++    def test_one_bare_tap_toggles_once_on_release_even_with_duplicate_down(self):
++        self.assertEqual(self.feed(fn(True)), (True, False))
++        self.assertEqual(self.feed(fn(True)), (True, False))
++        self.assertEqual(self.feed(fn(False)), (True, True))
++        self.assertEqual(self.feed(fn(False)), (False, False))
++
++    def test_local_press_or_changed_target_cannot_toggle(self):
++        for start, end in ((False, True), (True, False), (("pc", 1), ("pc", 2))):
++            with self.subTest(start=start, end=end):
++                self.feed(fn(True), start)
++                self.assertFalse(self.feed(fn(False), end)[1])
++
++    def test_function_flag_on_arrow_is_not_a_physical_fn_press(self):
++        for code in (0x7B, 0x7C, 0x7D, 0x7E, 0x7A):
++            self.feed({Q.kCGKeyboardEventKeycode: code, "flags": fn_language.FN_FLAG}, kind=Q.kCGEventKeyDown)
++            self.feed({Q.kCGKeyboardEventKeycode: code, "flags": fn_language.FN_FLAG}, kind=Q.kCGEventKeyUp)
++        self.assertEqual(self.feed(fn(False)), (False, False))
++
++    def test_fn_chords_and_mouse_buttons_do_not_toggle(self):
++        cases = [(Q.kCGEventKeyDown, {Q.kCGKeyboardEventKeycode: 0x7B}),
++                 (Q.kCGEventFlagsChanged, {Q.kCGKeyboardEventKeycode: 0x37, "flags": Q.kCGEventFlagMaskCommand}),
++                 (Q.kCGEventLeftMouseDown, {}), (Q.kCGEventScrollWheel, {}), (14, {})]
++        for kind, event in cases:
++            with self.subTest(kind=kind):
++                self.tap = fn_language.FnTap(Q)
++                self.feed(fn(True))
++                self.assertEqual(self.feed(event, kind=kind), (False, False))
++                self.assertEqual(self.feed(fn(False)), (True, False))
++
++    def test_keys_or_modifiers_already_held_do_not_toggle(self):
++        self.feed({Q.kCGKeyboardEventKeycode: 0}, kind=Q.kCGEventKeyDown)
++        self.feed(fn(True))
++        self.assertEqual(self.feed(fn(False)), (True, False))
++        self.tap = fn_language.FnTap(Q)
++        self.feed({**fn(True), "flags": fn_language.FN_FLAG | Q.kCGEventFlagMaskAlternate})
++        self.assertEqual(self.feed(fn(False)), (True, False))
++
++
++class ControllerTests(unittest.TestCase):
++    def setUp(self):
++        self.controller = bridge.KVMController(
++            replace(make_config(PAIRED_TOKEN), keyboard_sync=True),
++            logger=quiet_logger(), quartz=Q, clock=FakeClock(), link_factory=FakeLink)
++        self.link = bring_up(self.controller, caps=("input_language",))
++        redirect_to(self.controller)
++        self.link._sent.clear()
++
++    def capture(self, event, kind=Q.kCGEventFlagsChanged):
++        return self.controller._event_tap_callback(None, kind, event, None)
++
++    def drain(self):
++        while not self.controller.outbound.empty():
++            self.controller._process_outbound(self.controller.outbound.get_nowait())
++
++    def test_fn_reaches_existing_windows_protocol_and_next_key_carries_new_language(self):
++        language = ["ru"]
++        def select(value):
++            language[0] = value
++            return True
++        with mock.patch.object(bridge.keyboard_layout, "current_language", side_effect=lambda: language[0]), \
++                mock.patch.object(bridge.keyboard_layout, "select_language", side_effect=select) as selected:
++            self.assertIsNone(self.capture(fn(True)))
++            self.assertIsNone(self.capture(fn(False)))
++            self.drain()
++            selected.assert_called_once_with("en")
++            self.assertEqual(self.link._sent, [{"type": protocol.MSG_INPUT_LANGUAGE, "data": {"language": "en"}}])
++            self.capture({Q.kCGKeyboardEventKeycode: 0, "unicode": "a"}, Q.kCGEventKeyDown)
++            self.drain()
++            self.assertEqual(self.link._sent[-1]["data"]["input_language"], "en")
++            protocol.read_input(self.link._sent[0])
++
++    def test_fn_arrow_forwards_arrow_without_language_change(self):
++        with mock.patch.object(bridge.keyboard_layout, "select_language") as selected:
++            self.capture(fn(True))
++            self.capture({Q.kCGKeyboardEventKeycode: 0x7B, "flags": fn_language.FN_FLAG}, Q.kCGEventKeyDown)
++            self.capture({Q.kCGKeyboardEventKeycode: 0x7B, "flags": fn_language.FN_FLAG}, Q.kCGEventKeyUp)
++            self.capture(fn(False))
++            self.drain()
++            selected.assert_not_called()
++            self.assertEqual([m["data"]["key"] for m in self.link._sent], ["left", "left"])
++
++    def test_queued_toggle_dropped_after_returning_home(self):
++        self.capture(fn(True))
++        self.capture(fn(False))
++        self.controller.redirecting = False
++        with mock.patch.object(bridge.keyboard_layout, "select_language") as selected:
++            self.drain()
++            selected.assert_not_called()
++        self.assertEqual(self.link._sent, [])
++
++    def test_missing_source_does_not_send_a_toggle(self):
++        with mock.patch.object(bridge.keyboard_layout, "current_language", return_value="en"), \
++                mock.patch.object(bridge.keyboard_layout, "select_language", return_value=False):
++            self.capture(fn(True))
++            self.capture(fn(False))
++            self.drain()
++        self.assertEqual(self.link._sent, [])
++
++    def test_gate_requires_sync_keyboard_windows_peer_and_capability(self):
++        for change in ({"keyboard_sync": False}, {"mouse_only": True},
++                       {"ignored_inputs": ["key:63"]}):
++            with self.subTest(change=change):
++                saved = self.controller.cfg
++                self.controller.cfg = replace(saved, **change)
++                self.assertIsNone(self.controller._fn_sync_target())
++                self.controller.cfg = saved
++        self.link.peer_platform = "macos"
++        self.assertIsNone(self.controller._fn_sync_target())
++        self.link.peer_platform = "windows"
++        self.link.caps = set()
++        self.assertIsNone(self.controller._fn_sync_target())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mac_app/tests/test_keyboard_sync_mac.py b/mac_app/tests/test_keyboard_sync_mac.py
+new file mode 100644
+index 0000000..0ab0efc
+--- /dev/null
++++ b/mac_app/tests/test_keyboard_sync_mac.py
+@@ -0,0 +1,30 @@
++import tempfile
++import unittest
++from dataclasses import replace
++from pathlib import Path
++
++import config
++from settings_store import SettingsStore, config_to_raw, editable_default_config
++
++
++class SettingsTests(unittest.TestCase):
++    def test_language_and_opt_in_survive_a_restart(self):
++        cfg = replace(editable_default_config(), language="it", keyboard_sync=True)
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / "settings.json"
++            SettingsStore(path).save(config_to_raw(cfg))
++            restored = SettingsStore(path).load()
++            self.assertEqual(restored.language, "it")
++            self.assertTrue(restored.keyboard_sync)
++
++    def test_old_settings_default_off_and_an_invalid_language_does_not_crash(self):
++        raw = config_to_raw(editable_default_config())
++        raw.pop("keyboard_sync")
++        raw["language"] = []
++        cfg = config.parse_config(raw)
++        self.assertFalse(cfg.keyboard_sync)
++        self.assertEqual(cfg.language, "auto")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mac_app/windows_input.py b/mac_app/windows_input.py
+index f606b44..5b3d931 100644
+--- a/mac_app/windows_input.py
++++ b/mac_app/windows_input.py
+@@ -95,6 +95,7 @@ class WindowsInput:
+         return any("settings" in caps for caps in known) if known else None
+ 
+     def sync(self, cfg) -> None:
++        self.server.keyboard_sync = getattr(cfg, "keyboard_sync", False)
+         self._controller.crossing_displays_changed()
+         speeds = (cfg.pointer_speed, cfg.scroll_speed, cfg.reverse_scroll)
+         if self.server.input_scale is None or speeds != self._speeds:
+diff --git a/win_app/app_config.py b/win_app/app_config.py
+index cff507b..57f63e3 100644
+--- a/win_app/app_config.py
++++ b/win_app/app_config.py
+@@ -128,6 +128,7 @@ class Config:
+     # Every address the window shows is hidden.
+     hide_addresses: bool = False
+     language: str = "auto"
++    keyboard_sync: bool = False
+     # Same on all machines: the Crossing and Design pages kept in step with the Mac's, and the unix
+     # seconds of the last change to that or to a shared value; see settings_sync.
+     same_on_both: bool = False
+@@ -404,6 +405,7 @@ def config_from_dict(raw: dict) -> Config:
+             check_updates=raw.get("check_updates", True),
+             hide_addresses=raw.get("hide_addresses", False),
+             language=raw.get("language", "auto"),
++            keyboard_sync=raw.get("keyboard_sync") is True,
+             same_on_both=raw.get("same_on_both", False),
+             same_set_at=_stamp(raw.get("same_set_at", 0)),
+             same_groups=raw.get("same_groups", ["crossing", "design", "shortcut", "names"]
+@@ -512,6 +514,7 @@ def config_to_dict(config: Config) -> dict:
+         "trigger_style": config.trigger_style,
+         "double_tap_ms": int(config.double_tap_ms),
+         "modifier_style": config.modifier_style,
++        "keyboard_sync": config.keyboard_sync,
+         "block_while_dragging": config.block_while_dragging,
+         "hold_full_screen": config.hold_full_screen,
+         "show_in_tray": config.show_in_tray,
+diff --git a/win_app/input_injector.py b/win_app/input_injector.py
+index 4543351..cc159bd 100644
+--- a/win_app/input_injector.py
++++ b/win_app/input_injector.py
+@@ -14,6 +14,8 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
+ from core.keytable import EVDEV_US
+ from input_blocker import foreground_blocker
+ from firewall_win import is_elevated
++from keyboard_language import foreground_layout, select_language as sync_keyboard_language
++from core.i18n import tr
+ 
+ 
+ LOGGER = logging.getLogger(__name__)
+@@ -50,8 +52,10 @@ _IS_WINDOWS = sys.platform == "win32"
+ user32 = ctypes.WinDLL("user32", use_last_error=True) if _IS_WINDOWS else None
+ 
+ if _IS_WINDOWS:
+-    user32.VkKeyScanW.restype = ctypes.c_short
+-    user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
++    user32.VkKeyScanExW.restype = ctypes.c_short
++    user32.VkKeyScanExW.argtypes = [ctypes.c_wchar, ctypes.c_void_p]
++    user32.MapVirtualKeyExW.restype = ctypes.c_uint
++    user32.MapVirtualKeyExW.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+     user32.MapVirtualKeyW.restype = ctypes.c_uint
+     user32.MapVirtualKeyW.argtypes = [ctypes.c_uint, ctypes.c_uint]
+     user32.GetKeyboardLayout.restype = ctypes.c_void_p
+@@ -156,14 +160,14 @@ def _vk_key_scan(ch: str) -> int:
+     """
+     if user32 is None:
+         raise RuntimeError("VkKeyScanW is only available on Windows")
+-    return user32.VkKeyScanW(ch)
++    return user32.VkKeyScanExW(ch, foreground_layout())
+ 
+ 
+ def _map_virtual_key(vk: int) -> int:
+     """Look up the hardware scan code for a virtual-key code."""
+     if user32 is None:
+         raise RuntimeError("MapVirtualKeyW is only available on Windows")
+-    return user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
++    return user32.MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, foreground_layout())
+ 
+ 
+ def _key_at(us: str) -> Optional[Tuple[int, Optional[str]]]:
+@@ -174,14 +178,15 @@ def _key_at(us: str) -> Optional[Tuple[int, Optional[str]]]:
+     scan = US_SCAN_CODES.get(us)
+     if scan is None:
+         return None
+-    vk = user32.MapVirtualKeyW(scan, MAPVK_VSC_TO_VK)
++    layout = foreground_layout()
++    vk = user32.MapVirtualKeyExW(scan, MAPVK_VSC_TO_VK, layout)
+     if not vk:
+         return None
+     # Not MapVirtualKeyW's MAPVK_VK_TO_CHAR, which answers A to Z for the letter keys on every
+     # layout: on Russian the C key would read as "c" and a letter from an English Mac stay text.
+     # Flag 1<<2 leaves the keyboard state alone, so a dead key here eats no accent being typed.
+     buffer = ctypes.create_unicode_buffer(8)
+-    count = user32.ToUnicodeEx(vk, scan, (ctypes.c_char * 256)(), buffer, len(buffer), 1 << 2, user32.GetKeyboardLayout(0))
++    count = user32.ToUnicodeEx(vk, scan, (ctypes.c_char * 256)(), buffer, len(buffer), 1 << 2, layout)
+     return vk, buffer.value[:count] if count == 1 else None
+ 
+ 
+diff --git a/win_app/keyboard_language.py b/win_app/keyboard_language.py
+new file mode 100644
+index 0000000..92e7f04
+--- /dev/null
++++ b/win_app/keyboard_language.py
+@@ -0,0 +1,68 @@
++"""Select only installed RU/EN layouts for the foreground Windows application."""
++
++import ctypes
++import logging
++import sys
++import time
++
++LOGGER = logging.getLogger(__name__)
++user32 = ctypes.WinDLL("user32", use_last_error=True) if sys.platform == "win32" else None
++
++if user32 is not None:
++    user32.GetForegroundWindow.restype = ctypes.c_void_p
++    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
++    user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
++    user32.GetKeyboardLayout.argtypes = [ctypes.c_ulong]
++    user32.GetKeyboardLayout.restype = ctypes.c_void_p
++    user32.GetKeyboardLayoutList.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
++    user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
++
++
++def foreground_layout():
++    if user32 is None:
++        return None
++    window = user32.GetForegroundWindow()
++    thread = user32.GetWindowThreadProcessId(window, None) if window else 0
++    return user32.GetKeyboardLayout(thread)
++
++
++def language_of(layout):
++    primary = int(layout or 0) & 0x3ff
++    return {0x09: "en", 0x19: "ru"}.get(primary)
++
++
++def current_language():
++    return language_of(foreground_layout())
++
++
++def select_language(language):
++    if user32 is None or language not in {"en", "ru"}:
++        return False
++    window = user32.GetForegroundWindow()
++    if not window:
++        return False
++    thread = user32.GetWindowThreadProcessId(window, None)
++    if language_of(user32.GetKeyboardLayout(thread)) == language:
++        return True
++    count = user32.GetKeyboardLayoutList(0, None)
++    if count <= 0 or count > 256:
++        return False
++    values = (ctypes.c_void_p * count)()
++    actual = user32.GetKeyboardLayoutList(count, values)
++    matches = [value for value in values[:actual] if language_of(value) == language]
++    if not matches:
++        LOGGER.warning("No installed keyboard layout for %s; leaving the active layout unchanged", language)
++        return False
++    # WM_INPUTLANGCHANGEREQUEST is posted to the focused application, not to
++    # Beamer's worker thread. Applications may refuse the request.
++    if not user32.PostMessageW(window, 0x0050, 0, matches[0]):
++        return False
++    deadline = time.monotonic() + 0.25
++    while time.monotonic() < deadline:
++        if user32.GetForegroundWindow() != window:
++            return False
++        if language_of(user32.GetKeyboardLayout(thread)) == language:
++            return True
++        time.sleep(0.005)
++    LOGGER.warning("The foreground application did not accept the keyboard language %s", language)
++    return False
+diff --git a/win_app/kvm_bridge_win.py b/win_app/kvm_bridge_win.py
+index 4b14af3..4ef780f 100644
+--- a/win_app/kvm_bridge_win.py
++++ b/win_app/kvm_bridge_win.py
+@@ -2022,8 +2022,8 @@ class WindowsApplication(QWidget):
+             "platform": OWN_PLATFORM,
+             "app": VERSION[:32] if VERSION.isascii() and VERSION.isprintable() else "dev",
+             # A swipe has no shortcut every Linux desktop shares, so Linux does not offer gestures.
+-            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path")
+-                     if not (cap == "gestures" and OWN_PLATFORM == "linux")],
++            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language")
++                     if not (cap in ("gestures", "input_language") and OWN_PLATFORM == "linux")],
+             "port": self._settings_port,
+         }
+ 
+@@ -3469,6 +3469,7 @@ class WindowsApplication(QWidget):
+         self._debounce_save()
+ 
+     def _apply_input_scale(self, config: Config) -> None:
++        self.server.keyboard_sync = config.keyboard_sync
+         self.server.input_scale = receiver.InputScale(config.pointer_speed, config.scroll_speed, config.reverse_scroll)
+ 
+     def _modifier_module(self, current: Config) -> QWidget:
+@@ -3479,10 +3480,22 @@ class WindowsApplication(QWidget):
+         )
+         self.modifier_choice.set_names(tr("Modifier keys"))
+         module.body.addWidget(self.modifier_choice.view)
++        self.keyboard_sync_switch = widgets.Switch(tr("Synchronise Russian and English keyboard layouts"))
++        self.keyboard_sync_switch.setChecked(current.keyboard_sync)
++        self.keyboard_sync_switch.toggled.connect(self._set_keyboard_sync)
++        module.body.addWidget(self.keyboard_sync_switch)
++        module.body.addWidget(widgets.label(tr("Enable on both computers. Alt+Shift switches RU/EN while controlling another computer."), "note", wrap=True))
+         self.modifier_note = widgets.label(tr(MODIFIER_NOTES[current.modifier_style]), "note", wrap=True)
+         module.body.addWidget(self.modifier_note)
+         return module
+ 
++    def _set_keyboard_sync(self, enabled: bool) -> None:
++        if self._config is not None:
++            self._config.keyboard_sync = bool(enabled)
++            self.server.keyboard_sync = bool(enabled)
++            self._persist()
++            self.sender.update_config(self._config)
++
+     def _set_modifier_style(self, value: str) -> None:
+         self.modifier_note.setText(tr(MODIFIER_NOTES[value]))
+         if self._config is None:
+@@ -5147,6 +5160,7 @@ class WindowsApplication(QWidget):
+         self.trigger_recorder.set_title(TRIGGER_KEYS.get(config.trigger_key, config.trigger_key))
+         self.trigger_style_choice.set_value(config.trigger_style)
+         self._update_style_hint(config.trigger_style)
++        self.keyboard_sync_switch.setChecked(config.keyboard_sync)
+         self.modifier_choice.set_value(config.modifier_style)
+         self.modifier_note.setText(MODIFIER_NOTES[config.modifier_style])
+         self.glow_style_choice.set_value(config.glow_style)
+diff --git a/win_app/sender.py b/win_app/sender.py
+index fd6bc54..de19d8a 100644
+--- a/win_app/sender.py
++++ b/win_app/sender.py
+@@ -27,6 +27,8 @@ import threading
+ import time
+ from typing import Callable, Optional
+ 
++from core import keyboard_sync
++import keyboard_language
+ from core import ignored
+ from core import keytable
+ from core import owner as owner_module
+@@ -189,6 +191,7 @@ class LinkSender:
+         self._intent_keys_up: set = set()
+         self._intent_windows_up: set = set()
+         self._accepts: dict = {}        # peer id: whether it lets this PC drive it
++        self._keyboard_sync = keyboard_sync.Outbound(keyboard_language)
+         self._sent_names: dict = {}     # (peer, physical key): the name its press went out under
+         self._buttons_held = set()
+         self._shake_detector = None
+@@ -1328,6 +1331,7 @@ class LinkSender:
+                 LOGGER.exception("Clipboard work failed")
+ 
+     def _forget_held(self, peer: bytes) -> None:
++        self._keyboard_sync.forget(peer)
+         """`peer`'s link is lost: what waited for its clipboard is for a link that is gone."""
+         with self._clip_lock:
+             self._clip_wait.pop(peer, None)
+@@ -1336,6 +1340,11 @@ class LinkSender:
+                 self._sent_names.pop(held, None)
+ 
+     def _send(self, peer: bytes, message: dict) -> None:
++        for part in self._keyboard_sync.messages(peer, message,
++                enabled=self._setting("keyboard_sync", False), caps=self.links.caps(peer)):
++            self._send_part(peer, part)
++
++    def _send_part(self, peer: bytes, message: dict) -> None:
+         kind = message["type"]
+         if kind == protocol.MSG_KEYDOWN and message.get("data", {}).get("key") == "tab":
+             for transition in self._switcher_transition(peer):
+@@ -1349,6 +1358,8 @@ class LinkSender:
+                 data.get("resistance_px"), data.get("reach"), bool(data.get("stay")),
+                 display=data.get("display"), side=data.get("side"),
+             )
++            if data.get("input_language") is not None:
++                message["data"]["input_language"] = data["input_language"]
+         elif kind in (protocol.MSG_KEYDOWN, protocol.MSG_KEYUP):
+             preserve = message.pop("_preserve_key_name", False)
+             message = self._key_message(peer, message, preserve=preserve)
+diff --git a/win_app/tests/test_keyboard_language.py b/win_app/tests/test_keyboard_language.py
+new file mode 100644
+index 0000000..cf3f791
+--- /dev/null
++++ b/win_app/tests/test_keyboard_language.py
+@@ -0,0 +1,61 @@
++import unittest
++from unittest import mock
++
++import input_injector
++import keyboard_language
++
++
++class ForegroundTests(unittest.TestCase):
++    def test_installed_layout_is_requested_on_the_foreground_window_and_confirmed(self):
++        api = mock.Mock()
++        api.GetForegroundWindow.return_value = 123
++        api.GetWindowThreadProcessId.return_value = 456
++        api.GetKeyboardLayout.side_effect = [0x4090409, 0x4190419]
++
++        def layouts(count, values):
++            if values is not None:
++                values[0], values[1] = 0x4090409, 0x4190419
++            return 2
++
++        api.GetKeyboardLayoutList.side_effect = layouts
++        with mock.patch.object(keyboard_language, "user32", api):
++            self.assertTrue(keyboard_language.select_language("ru"))
++        api.PostMessageW.assert_called_once_with(123, 0x0050, 0, 0x4190419)
++        api.ActivateKeyboardLayout.assert_not_called()
++
++    def test_character_and_position_resolution_use_the_foreground_layout(self):
++        api = mock.Mock()
++        api.VkKeyScanExW.return_value = 0xBE
++        api.MapVirtualKeyExW.return_value = 52
++        api.ToUnicodeEx.return_value = 0
++        with mock.patch.object(input_injector, "user32", api), \
++                mock.patch.object(input_injector, "foreground_layout", return_value=0x4190419):
++            self.assertEqual(input_injector._vk_key_scan("ю"), 0xBE)
++            input_injector._map_virtual_key(0xBE)
++            input_injector._key_at(".")
++        api.VkKeyScanExW.assert_called_once_with("ю", 0x4190419)
++        self.assertEqual(api.MapVirtualKeyExW.call_args_list[0].args, (0xBE, 0, 0x4190419))
++        self.assertEqual(api.ToUnicodeEx.call_args.args[-1], 0x4190419)
++        api.GetKeyboardLayout.assert_not_called()
++
++    def test_foreground_thread_not_beamers_worker_is_queried(self):
++        api = mock.Mock()
++        api.GetForegroundWindow.return_value = 123
++        api.GetWindowThreadProcessId.return_value = 456
++        api.GetKeyboardLayout.return_value = 0x4190419
++        with mock.patch.object(keyboard_language, "user32", api):
++            self.assertEqual(keyboard_language.current_language(), "ru")
++        api.GetKeyboardLayout.assert_called_once_with(456)
++
++    def test_an_uninstalled_language_never_loads_a_layout_or_changes_the_window(self):
++        api = mock.Mock()
++        api.GetForegroundWindow.return_value = 123
++        api.GetKeyboardLayout.return_value = 0x4090409
++        api.GetKeyboardLayoutList.return_value = 0
++        with mock.patch.object(keyboard_language, "user32", api):
++            self.assertFalse(keyboard_language.select_language("ru"))
++        api.PostMessageW.assert_not_called()
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.54.0 (Apple Git-157)
+

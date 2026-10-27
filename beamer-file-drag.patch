@@ -1,0 +1,2876 @@
+diff --git a/core/drag_coordinator.py b/core/drag_coordinator.py
+new file mode 100644
+index 0000000..eca60a2
+--- /dev/null
++++ b/core/drag_coordinator.py
+@@ -0,0 +1,92 @@
++"""Bridge a platform file-drag gesture to the staged peer handoff.
++
++The platform supplies the native drag cancellation and the input transition.
++The input transition must enqueue focus and the held mouse button before the
++handoff sends drag_start on that same ordered link.
++"""
++
++import logging
++import threading
++
++LOGGER = logging.getLogger(__name__)
++
++
++class DragCoordinator:
++    def __init__(self, handoff, button_down, cancel_source, cross, failed=lambda exc: None):
++        self._handoff = handoff
++        self._button_down = button_down
++        self._cancel_source = cancel_source
++        self._cross = cross
++        self._failed = failed
++        self._lock = threading.RLock()
++        self._generation = 0
++        self._running = False
++        self._closed = False
++
++    def begin(self, files, crossing):
++        """Start preparing files without blocking the native input callback."""
++        files = tuple(files)
++        if not files:
++            return False
++        with self._lock:
++            if self._closed or self._running or not self._button_down():
++                return False
++            self._running = True
++            generation = self._generation
++        try:
++            threading.Thread(target=self._prepare, args=(files, crossing, generation),
++                             name="Beamer-drag-handoff", daemon=True).start()
++        except RuntimeError:
++            with self._lock:
++                self._running = False
++            raise
++        return True
++
++    def _prepare(self, files, crossing, generation):
++        try:
++            ident = self._handoff.prepare(files)
++            with self._lock:
++                if self._closed or generation != self._generation or not self._button_down():
++                    self._handoff.cancel()
++                    return
++            # The platform may marshal the transition to its input thread;
++            # never hold this lock while waiting for that thread.
++            self._cancel_source()
++            if not self._cross(crossing):
++                self._handoff.cancel()
++                raise ConnectionError("could not cross during file drag")
++            with self._lock:
++                if self._closed or generation != self._generation:
++                    self._handoff.cancel()
++                    return
++            if not self._handoff.start_crossing(ident):
++                raise ConnectionError("could not start the peer drag")
++        except Exception as exc:
++            try:
++                self._handoff.cancel()
++            except Exception:
++                LOGGER.exception("Could not cancel a failed file drag")
++            with self._lock:
++                cancelled = self._closed or generation != self._generation
++            if not cancelled:
++                LOGGER.warning("File drag could not be handed over: %s", exc)
++                self._failed(exc)
++        finally:
++            with self._lock:
++                self._running = False
++
++    def button_released(self):
++        """Call when a release arrives before the peer drag has started."""
++        with self._lock:
++            self._generation += 1
++            running = self._running
++        if running:
++            self._handoff.cancel()
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++            self._generation += 1
++            running = self._running
++        if running:
++            self._handoff.cancel()
+diff --git a/core/drag_handoff.py b/core/drag_handoff.py
+new file mode 100644
+index 0000000..2585323
+--- /dev/null
++++ b/core/drag_handoff.py
+@@ -0,0 +1,290 @@
++"""Coordinate staged file transfers with a platform's native drag session.
++
++The transport is an authenticated Beamer link. A source transfers every file
++before permitting a crossing; the target starts its native drag only after a
++separate crossing notification. Neither class changes mouse ownership itself.
++"""
++
++import re
++import secrets
++import shutil
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++from . import file_transfer
++
++MAX_FILES = 32
++_ID = re.compile(r"[0-9a-f]{32}")
++DRAG_TYPES = frozenset({"drag_begin", "drag_ready", "drag_start", "drag_cancel", "drag_ack"})
++
++
++def read_drag(message):
++    if (not isinstance(message, dict) or getattr(message, "malformed", False)
++            or set(message) != {"type", "data"} or not isinstance(message["data"], dict)):
++        return None
++    kind, data = message["type"], message["data"]
++    ident = data.get("id")
++    if kind not in DRAG_TYPES or not isinstance(ident, str) or not _ID.fullmatch(ident):
++        return None
++    if kind == "drag_begin" and set(data) == {"id", "count"}:
++        if type(data["count"]) is int and 1 <= data["count"] <= MAX_FILES:
++            return {"type": kind, **data}
++    if kind in ("drag_ready", "drag_start", "drag_cancel") and set(data) == {"id"}:
++        return {"type": kind, **data}
++    if kind == "drag_ack" and set(data) == {"id", "stage"} and data["stage"] in ("begin", "ready"):
++        return {"type": kind, **data}
++    return None
++
++
++def read_transfer(message):
++    """Validate either a drag control record or a bounded file record."""
++    return read_drag(message) or file_transfer.read_record(message)
++
++
++class DragHandoff:
++    """One link's drag protocol; all send-side methods run off the GUI thread.
++
++    start_native(paths, release) runs on this object's dispatcher thread. It
++    must marshal onto the UI thread and invoke release only when staged files
++    are no longer needed; a target may copy them after the drag loop ends.
++    The source must invoke start_crossing only after pointer ownership changes.
++    """
++
++    def __init__(self, post, start_native, *, allow_incoming=lambda: False, timeout=30):
++        self._post, self._start_native = post, start_native
++        self._allow_incoming, self._timeout = allow_incoming, timeout
++        self._cond = threading.Condition(threading.RLock())
++        self._closed = False
++        self._outgoing = None
++        self._prepared = False
++        self._cancelled = False
++        self._ack = None
++        self._incoming = None
++        self._retained = set()
++        self._endpoint = file_transfer.TransferEndpoint(post, self._accept, self._completed, timeout)
++
++    def _send(self, kind, ident, **data):
++        if not self._post({"type": kind, "data": {"id": ident, **data}}):
++            raise ConnectionError("drag link is unavailable")
++
++    def _accept(self, name, size):
++        with self._cond:
++            state = self._incoming
++            if (state is None or state["ready"] or len(state["files"]) >= state["count"]
++                    or state["bytes"] + size > file_transfer.MAX_FILE_BYTES
++                    or name.casefold() in state["names"]):
++                return None
++            state["names"].add(name.casefold())
++            state["bytes"] += size
++            return state["directory"]
++
++    def _completed(self, path):
++        with self._cond:
++            if self._incoming is not None:
++                self._incoming["files"].append(Path(path))
++
++    def _wait(self, ident, stage):
++        deadline = time.monotonic() + self._timeout
++        with self._cond:
++            while self._ack is None and not self._closed:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError("drag handoff timed out")
++                self._cond.wait(remaining)
++            ack, self._ack = self._ack, None
++            if self._closed or ack is None or ack["type"] == "drag_cancel":
++                raise ConnectionError("drag handoff cancelled")
++            if ack["id"] != ident or ack["stage"] != stage:
++                raise ValueError("unexpected drag acknowledgement")
++
++    def prepare(self, paths):
++        paths = list(paths)
++        if not 1 <= len(paths) <= MAX_FILES:
++            raise ValueError("unsupported number of files")
++        names = [Path(path).name for path in paths]
++        if (not all(file_transfer.valid_name(name) for name in names)
++                or len({name.casefold() for name in names}) != len(names)):
++            raise ValueError("unsupported or duplicate file names")
++        ident = secrets.token_hex(16)
++        with self._cond:
++            if self._closed or self._outgoing is not None:
++                raise RuntimeError("drag handoff unavailable or busy")
++            self._outgoing = ident
++            self._prepared = False
++            self._cancelled = False
++        try:
++            self._send("drag_begin", ident, count=len(paths))
++            self._wait(ident, "begin")
++            for path in paths:
++                with self._cond:
++                    if self._cancelled or self._closed:
++                        raise ConnectionError("drag handoff cancelled")
++                self._endpoint.send_file(path)
++            with self._cond:
++                if self._cancelled or self._closed:
++                    raise ConnectionError("drag handoff cancelled")
++            self._send("drag_ready", ident)
++            self._wait(ident, "ready")
++            with self._cond:
++                if self._cancelled or self._closed:
++                    raise ConnectionError("drag handoff cancelled")
++                self._prepared = True
++            return ident
++        except Exception:
++            try:
++                self._send("drag_cancel", ident)
++            except Exception:
++                pass
++            with self._cond:
++                self._outgoing = None
++                self._prepared = False
++                self._ack = None
++            raise
++
++    def start_crossing(self, ident):
++        with self._cond:
++            if self._closed or self._outgoing != ident or not self._prepared:
++                return False
++            self._outgoing = None
++            self._prepared = False
++        self._send("drag_start", ident)
++        return True
++
++    def cancel(self):
++        with self._cond:
++            ident = self._outgoing
++            if ident is None:
++                return False
++            self._cancelled = True
++            if self._prepared:
++                self._outgoing = None
++                self._prepared = False
++                self._ack = None
++            else:
++                self._ack = {"type": "drag_cancel", "id": ident}
++            self._cond.notify_all()
++        self._endpoint.cancel_outgoing()
++        try:
++            self._send("drag_cancel", ident)
++        except Exception:
++            pass
++        return True
++
++    def handle(self, message):
++        if isinstance(message, dict) and message.get("type") in file_transfer.FILE_TYPES:
++            return self._endpoint.handle(message)
++        record = read_drag(message)
++        if record is None:
++            return False
++        kind, ident = record["type"], record["id"]
++        discard, refuse = None, False
++        with self._cond:
++            if self._closed:
++                return False
++            if kind == "drag_ack" or (kind == "drag_cancel" and ident == self._outgoing):
++                if ident == self._outgoing and self._ack is None:
++                    self._ack = record
++                    self._cond.notify_all()
++                return True
++            if kind == "drag_begin":
++                if self._incoming is not None or not self._allow_incoming():
++                    self._send("drag_cancel", ident)
++                    return True
++                directory = tempfile.mkdtemp(prefix="beamer-drag-")
++                self._incoming = {"id": ident, "directory": directory, "count": record["count"],
++                                  "files": [], "names": set(), "bytes": 0, "ready": False}
++                self._send("drag_ack", ident, stage="begin")
++                return True
++            state = self._incoming
++            if state is None or state["id"] != ident:
++                return True
++            if kind == "drag_cancel":
++                self._incoming = None
++                discard = state["directory"]
++            elif kind == "drag_ready":
++                if len(state["files"]) != state["count"]:
++                    self._incoming = None
++                    discard, refuse = state["directory"], True
++                else:
++                    state["ready"] = True
++                    self._send("drag_ack", ident, stage="ready")
++            elif kind == "drag_start" and state["ready"]:
++                self._incoming = None
++                directory = state["directory"]
++                self._retained.add(directory)
++                def release():
++                    with self._cond:
++                        if directory not in self._retained:
++                            return
++                        self._retained.remove(directory)
++                    shutil.rmtree(directory, ignore_errors=True)
++                try:
++                    self._start_native(tuple(state["files"]), release)
++                except Exception:
++                    release()
++                    raise
++        if discard is not None:
++            self._endpoint.cancel_incoming()
++            shutil.rmtree(discard, ignore_errors=True)
++            if refuse:
++                self._send("drag_cancel", ident)
++        return True
++
++    def close(self):
++        self._endpoint.close()
++        with self._cond:
++            self._closed = True
++            state, self._incoming = self._incoming, None
++            self._cond.notify_all()
++        if state is not None:
++            shutil.rmtree(state["directory"], ignore_errors=True)
++
++
++class DragLinks:
++    """Attach a handoff and worker to each authenticated connection."""
++
++    def __init__(self, start_native, allow_incoming=lambda: False, limit=16):
++        self._start_native = start_native
++        self._allow_incoming = allow_incoming
++        self._limit = limit
++        self._lock = threading.Lock()
++        self._sessions = {}
++
++    def session(self, link, post=None):
++        with self._lock:
++            if link in self._sessions:
++                return self._sessions[link][0]
++            if len(self._sessions) >= self._limit:
++                raise RuntimeError("too many file transfer links")
++            session = DragHandoff(post or link.post, self._start_native, allow_incoming=self._allow_incoming)
++            dispatcher = file_transfer.TransferDispatcher(session, validator=read_transfer)
++            self._sessions[link] = (session, dispatcher)
++            return session
++
++    def receive(self, link, message):
++        if read_transfer(message) is None:
++            return False
++        with self._lock:
++            item = self._sessions.get(link)
++        if item is None:
++            if message.get("type") != "drag_begin":
++                return False
++            self.session(link)
++            with self._lock:
++                item = self._sessions.get(link)
++        return item is not None and item[1].deliver(message)
++
++    def disconnect(self, link):
++        with self._lock:
++            item = self._sessions.pop(link, None)
++        if item is not None:
++            item[1].close()
++
++    def close(self):
++        with self._lock:
++            items = list(self._sessions.values())
++            self._sessions.clear()
++        for _session, dispatcher in items:
++            dispatcher.close()
+diff --git a/core/file_transfer.py b/core/file_transfer.py
+new file mode 100644
+index 0000000..4b5c8ad
+--- /dev/null
++++ b/core/file_transfer.py
+@@ -0,0 +1,391 @@
++"""Bounded file-transfer primitives; not yet connected to the platform UI.
++
++The receiver stages bytes in the destination directory and publishes a verified
++file without replacing an existing entry. Callers must authenticate the peer,
++obtain the user's intent, and arrange cancellation on disconnect.
++"""
++
++import base64
++import binascii
++import hashlib
++import os
++import queue
++import re
++import secrets
++import stat
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++MAX_FILE_BYTES = 10 * 1024**3
++MAX_CHUNK_BYTES = 32 * 1024
++_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.I)
++_ID = re.compile(r"[0-9a-f]{32}")
++FILE_TYPES = frozenset({"file_offer", "file_chunk", "file_finish", "file_cancel", "file_ack"})
++
++
++def read_record(message):
++    """Validate a compact transfer record. Call only after peer authentication.
++
++    Returns a normalized record or None. The transport must negotiate support,
++    bound the number of active transfers, and apply authorization separately.
++    """
++    if not isinstance(message, dict) or getattr(message, "malformed", False) or set(message) != {"type", "data"}:
++        return None
++    kind, data = message["type"], message["data"]
++    if not isinstance(data, dict):
++        return None
++    ident = data.get("id")
++    if not isinstance(ident, str) or not _ID.fullmatch(ident):
++        return None
++    if kind == "file_offer" and set(data) == {"id", "name", "size"}:
++        size = data["size"]
++        if valid_name(data["name"]) and type(size) is int and 0 <= size <= MAX_FILE_BYTES:
++            return {"type": kind, "id": ident, "name": data["name"], "size": size}
++    elif kind == "file_chunk" and set(data) == {"id", "offset", "bytes"}:
++        encoded, offset = data["bytes"], data["offset"]
++        if (isinstance(encoded, str) and len(encoded) <= ((MAX_CHUNK_BYTES + 2) // 3) * 4
++                and type(offset) is int and 0 <= offset <= MAX_FILE_BYTES):
++            try:
++                chunk = base64.b64decode(encoded, validate=True)
++            except (ValueError, binascii.Error):
++                return None
++            if 0 < len(chunk) <= MAX_CHUNK_BYTES and offset + len(chunk) <= MAX_FILE_BYTES:
++                return {"type": kind, "id": ident, "offset": offset, "bytes": chunk}
++    elif kind == "file_finish" and set(data) == {"id", "sha256"}:
++        digest = data["sha256"]
++        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
++            return {"type": kind, "id": ident, "sha256": digest}
++    elif kind == "file_cancel" and set(data) == {"id"}:
++        return {"type": kind, "id": ident}
++    elif kind == "file_ack" and set(data) == {"id", "stage", "offset"}:
++        stage, offset = data["stage"], data["offset"]
++        if stage in ("offer", "chunk", "finish") and type(offset) is int and 0 <= offset <= MAX_FILE_BYTES:
++            return {"type": kind, "id": ident, "stage": stage, "offset": offset}
++    return None
++
++
++def valid_name(name):
++    """Accept a single portable filename, never a path or Windows device name."""
++    try:
++        return (isinstance(name, str) and 0 < len(name.encode("utf-8")) <= 240
++                and name not in (".", "..") and name[-1] not in " ."
++                and not _RESERVED.fullmatch(name)
++                and not any(ord(c) < 32 or c in '<>:"/\\|?*' for c in name))
++    except UnicodeEncodeError:
++        return False
++
++
++def file_records(path, ident):
++    """Yield an offer, bounded chunks and a digest for one regular file.
++
++    The caller controls delivery and cancellation and must not send chunks until
++    the peer has accepted the offer. Files changing size during a read abort.
++    """
++    if not isinstance(ident, str) or not _ID.fullmatch(ident):
++        raise ValueError("invalid transfer id")
++    name = Path(path).name
++    if not valid_name(name):
++        raise ValueError("invalid file name")
++    if os.path.islink(path):
++        raise ValueError("symbolic links are not supported")
++    # Avoid waiting forever on a FIFO or following a symlink swapped in after
++    # the first check. Windows may not expose these flags; fstat still rejects
++    # non-regular files before anything is sent.
++    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
++    with os.fdopen(os.open(path, flags), "rb") as source:
++        info = os.fstat(source.fileno())
++        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
++            raise ValueError("not a supported regular file")
++        yield {"type": "file_offer", "data": {"id": ident, "name": name, "size": info.st_size}}
++        digest = hashlib.sha256()
++        offset = 0
++        while offset < info.st_size:
++            chunk = source.read(min(MAX_CHUNK_BYTES, info.st_size - offset))
++            if not chunk:
++                raise OSError("source file became shorter")
++            digest.update(chunk)
++            yield {"type": "file_chunk", "data": {"id": ident, "offset": offset,
++                                                   "bytes": base64.b64encode(chunk).decode("ascii")}}
++            offset += len(chunk)
++        if source.read(1):
++            raise OSError("source file became longer")
++        yield {"type": "file_finish", "data": {"id": ident, "sha256": digest.hexdigest()}}
++
++
++class IncomingFile:
++    """One ordered incoming file, explicitly committed only after verification."""
++
++    def __init__(self, directory, name, size):
++        if not valid_name(name) or type(size) is not int or not 0 <= size <= MAX_FILE_BYTES:
++            raise ValueError("invalid file name or size")
++        self.directory = Path(directory)
++        self.destination = self.directory / name
++        fd, path = tempfile.mkstemp(prefix=".beamer-transfer-", dir=self.directory)
++        self._path = Path(path)
++        self._file = os.fdopen(fd, "wb")
++        self._size = size
++        self._written = 0
++        self._digest = hashlib.sha256()
++
++    def write(self, offset, data):
++        if self._file is None:
++            raise ValueError("transfer is closed")
++        if (type(offset) is not int or offset != self._written or not isinstance(data, bytes)
++                or not 0 < len(data) <= MAX_CHUNK_BYTES or self._written + len(data) > self._size):
++            raise ValueError("invalid file chunk")
++        self._file.write(data)
++        self._digest.update(data)
++        self._written += len(data)
++
++    def finish(self, digest):
++        if self._file is None:
++            raise ValueError("transfer is closed")
++        if (self._written != self._size or not isinstance(digest, str)
++                or not re.fullmatch(r"[0-9a-f]{64}", digest)
++                or self._digest.hexdigest() != digest):
++            self.cancel()
++            raise ValueError("file size or checksum mismatch")
++        try:
++            self._file.flush()
++            self._file.close()
++            self._file = None
++            # link() is atomic and fails when the destination already exists, even
++            # if another process creates it between receiving and publishing.
++            os.link(self._path, self.destination)
++        finally:
++            self.cancel()
++        return self.destination
++
++    def cancel(self):
++        if self._file is not None:
++            self._file.close()
++            self._file = None
++        try:
++            self._path.unlink()
++        except FileNotFoundError:
++            pass
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *unused):
++        self.cancel()
++
++
++class TransferEndpoint:
++    """One peer's transfer state, using an authenticated, ordered message link.
++
++    `accept` must return a destination directory only for an authorized offer;
++    None refuses it. `post` returns false if the connection cannot queue a
++    message. Acknowledging every chunk bounds buffering on both sides. The
++    application calls close on disconnect and must keep this object per link.
++    send_file blocks and belongs on a worker, not a GUI or link-reader thread.
++    """
++
++    def __init__(self, post, accept, completed=lambda path: None, timeout=30):
++        self._post = post
++        self._accept = accept
++        self._completed = completed
++        self._timeout = timeout
++        self._condition = threading.Condition(threading.RLock())
++        self._incoming = None
++        self._outgoing = None
++        self._reply = None
++        self._closed = False
++
++    @staticmethod
++    def _message(kind, ident, **data):
++        return {"type": kind, "data": {"id": ident, **data}}
++
++    def _send(self, message):
++        if not self._post(message):
++            raise ConnectionError("file transfer link is unavailable")
++
++    def _wait(self, ident, stage, offset):
++        deadline = time.monotonic() + self._timeout
++        with self._condition:
++            while self._reply is None and not self._closed:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError("file transfer acknowledgement timed out")
++                self._condition.wait(remaining)
++            response, self._reply = self._reply, None
++            if self._closed or response is None or response["type"] == "file_cancel":
++                raise ConnectionError("file transfer cancelled")
++            if response["id"] != ident or response["stage"] != stage or response["offset"] != offset:
++                raise ValueError("unexpected file transfer acknowledgement")
++
++    def send_file(self, path):
++        ident = secrets.token_hex(16)
++        with self._condition:
++            if self._closed or self._outgoing is not None:
++                raise RuntimeError("file transfer unavailable or busy")
++            self._outgoing = ident
++        offset = 0
++        records = file_records(path, ident)
++        try:
++            offer = next(records)
++            self._send(offer)
++            self._wait(ident, "offer", 0)
++            for message in records:
++                if message["type"] == "file_chunk":
++                    chunk = read_record(message)
++                    offset += len(chunk["bytes"])
++                    stage = "chunk"
++                else:
++                    stage = "finish"
++                self._send(message)
++                self._wait(ident, stage, offset)
++            return offset
++        except Exception:
++            try:
++                self._post(self._message("file_cancel", ident))
++            except Exception:
++                pass
++            raise
++        finally:
++            records.close()
++            with self._condition:
++                self._outgoing = None
++                self._reply = None
++
++    def cancel_outgoing(self):
++        """Interrupt a sender waiting for its peer, e.g. on mouse release."""
++        with self._condition:
++            ident = self._outgoing
++            if ident is None:
++                return False
++            self._reply = {"type": "file_cancel", "id": ident}
++            self._condition.notify_all()
++        try:
++            self._post(self._message("file_cancel", ident))
++        except Exception:
++            pass
++        return True
++
++    def cancel_incoming(self):
++        """Close and discard a partial incoming file without closing the link."""
++        with self._condition:
++            if self._incoming is None:
++                return False
++            self._incoming[1].cancel()
++            self._incoming = None
++            return True
++
++    def handle(self, message):
++        """Handle one record. False means malformed or not a transfer record."""
++        record = read_record(message)
++        if record is None:
++            return False
++        ident, kind = record["id"], record["type"]
++        with self._condition:
++            if self._closed:
++                return True
++            if kind == "file_ack" or (kind == "file_cancel" and ident == self._outgoing):
++                if ident == self._outgoing and self._reply is None:
++                    self._reply = record
++                    self._condition.notify_all()
++                return True
++            if kind == "file_offer":
++                if self._incoming is not None:
++                    self._send(self._message("file_cancel", ident))
++                    return True
++                try:
++                    directory = self._accept(record["name"], record["size"])
++                    if directory is None:
++                        raise ValueError("file offer refused")
++                    self._incoming = (ident, IncomingFile(directory, record["name"], record["size"]))
++                    self._send(self._message("file_ack", ident, stage="offer", offset=0))
++                except Exception:
++                    if self._incoming is not None:
++                        self._incoming[1].cancel()
++                        self._incoming = None
++                    self._send(self._message("file_cancel", ident))
++                return True
++            if self._incoming is None or self._incoming[0] != ident:
++                return True
++            incoming = self._incoming[1]
++            completed_path = None
++            try:
++                if kind == "file_cancel":
++                    incoming.cancel()
++                    self._incoming = None
++                elif kind == "file_chunk":
++                    incoming.write(record["offset"], record["bytes"])
++                    self._send(self._message("file_ack", ident, stage="chunk", offset=incoming._written))
++                elif kind == "file_finish":
++                    path = incoming.finish(record["sha256"])
++                    offset = incoming._written
++                    self._incoming = None
++                    self._send(self._message("file_ack", ident, stage="finish", offset=offset))
++                    completed_path = path
++            except Exception:
++                incoming.cancel()
++                self._incoming = None
++                self._send(self._message("file_cancel", ident))
++            if completed_path is not None:
++                self._completed(completed_path)
++        return True
++
++    def close(self):
++        with self._condition:
++            self._closed = True
++            if self._incoming is not None:
++                self._incoming[1].cancel()
++                self._incoming = None
++            self._condition.notify_all()
++
++
++class TransferDispatcher:
++    """Run disk and platform callbacks away from the input link's reader.
++
++    One per authenticated link. Capacity is intentionally small: the protocol
++    waits for each acknowledgement, so a cooperative peer never needs a
++    backlog. An overflowing peer loses its transfer session, not input.
++    """
++
++    def __init__(self, endpoint, max_pending=8, validator=read_record):
++        self._endpoint = endpoint
++        self._validator = validator
++        self._queue = queue.Queue(maxsize=max_pending)
++        self._closing = threading.Event()
++        self._stopped = threading.Event()
++        self._thread = threading.Thread(target=self._run, name="Beamer-file-transfer", daemon=True)
++        self._thread.start()
++
++    def deliver(self, message):
++        if self._closing.is_set() or self._validator(message) is None:
++            return False
++        try:
++            self._queue.put_nowait(message)
++        except queue.Full:
++            self._closing.set()
++            return False
++        return True
++
++    def _run(self):
++        try:
++            while not self._closing.is_set():
++                try:
++                    message = self._queue.get(timeout=0.1)
++                except queue.Empty:
++                    continue
++                try:
++                    self._endpoint.handle(message)
++                except Exception:
++                    # A link that cannot send the response can no longer
++                    # complete this session; dispose its partial files.
++                    self._closing.set()
++        finally:
++            try:
++                self._endpoint.close()
++            finally:
++                self._stopped.set()
++
++    def close(self):
++        self._closing.set()
++
++    def wait_closed(self, timeout=None):
++        return self._stopped.wait(timeout)
+diff --git a/core/link.py b/core/link.py
+index 34f42be..02a995d 100644
+--- a/core/link.py
++++ b/core/link.py
+@@ -24,6 +24,8 @@ import time
+ from core import peerlist
+ from core import protocol
+ from core import receiver
++from core import file_transfer
++from core import drag_handoff
+ from core.i18n import tr
+ from core.response_time import ResponseTime
+ from core.link_timing import LinkTiming
+@@ -769,6 +771,8 @@ class OutboundLink:
+         if not self._live:
+             return False
+         kind = message.get("type")
++        if kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES and "file_transfer" not in self._caps:
++            return False
+         if kind in (protocol.MSG_FOCUS, protocol.MSG_SWITCH) and "displays" not in self._caps:
+             data = dict(message.get("data") or {})
+             data.pop("display", None)
+@@ -1014,6 +1018,8 @@ def _weight(message):
+     """About how many bytes a queued message holds: a clipboard's text and image, else nothing."""
+     if message.get("type") == protocol.MSG_MOUSEMOVE:
+         return len((message.get("data") or {}).get("samples", ())) * 32
++    if message.get("type") == "file_chunk":
++        return len((message.get("data") or {}).get("bytes") or "")
+     if message.get("type") != protocol.MSG_CLIPBOARD:
+         return 0
+     data = message.get("data") or {}
+diff --git a/core/owner.py b/core/owner.py
+index 4e0227b..53d9e11 100644
+--- a/core/owner.py
++++ b/core/owner.py
+@@ -309,6 +309,19 @@ class Owner:
+ 
+     # Input
+ 
++    def adopt_local_button(self, name):
++        """Transfer one locally held button to the current peer for a file drag.
++
++        A caller must have independently established that a file drag is being
++        handed over and that the physical button is still held. Normal input
++        keeps the existing rule that a local press is released locally.
++        """
++        ident = ("button", name)
++        if self.on is None or ident not in self._here:
++            return []
++        self._here.remove(ident)
++        return self.input({"type": "mousedown", "data": {"button": name}})
++
+     def input(self, message):
+         kind, ident = message.get("type"), _ident(message)
+         if ident in self._here:
+diff --git a/core/receiver.py b/core/receiver.py
+index 7826abc..6621edc 100644
+--- a/core/receiver.py
++++ b/core/receiver.py
+@@ -18,6 +18,8 @@ from typing import Callable, Optional, Tuple
+ from . import return_edge as crossing
+ from . import peerlist
+ from . import protocol
++from . import file_transfer
++from . import drag_handoff
+ from .i18n import tr, trc
+ from .response_time import ResponseTime
+ from .link_timing import LinkTiming
+@@ -541,6 +543,10 @@ class LinkResponder:
+         arrangement_callback=None,
+         settings_callback=None,
+         identify_callback=None,
++        file_callback=None,
++        file_disconnected_callback=None,
++        file_drag_edge_callback=None,
++        file_drag_release_callback=None,
+         paired_callback=None,
+         link_callback=None,
+         announce=None,
+@@ -561,6 +567,10 @@ class LinkResponder:
+             "owner": owner_callback, "arrival": arrival_callback, "pressure": pressure_callback,
+             "arrangement": arrangement_callback, "settings": settings_callback, "paired": paired_callback,
+             "identify": identify_callback,
++            "file": file_callback,
++            "file_disconnected": file_disconnected_callback,
++            "file_drag_edge": file_drag_edge_callback,
++            "file_drag_release": file_drag_release_callback,
+             "link": link_callback,
+         }
+         self._announce = announce or (lambda peer: [])
+@@ -954,6 +964,7 @@ class LinkResponder:
+                     link.timing.flush(ping_ms=link.response_time_ms)
+         finally:
+             link.close()
++            self._callback("file_disconnected", link)
+             with self._lock:
+                 current = self._links.get(link.peer_id) is link
+                 if current:
+@@ -1053,6 +1064,9 @@ class LinkResponder:
+                 self._on_focus(link, message)
+             elif kind == protocol.MSG_CLIPBOARD:
+                 self._on_clipboard(link, message)
++            elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
++                if "file_transfer" in link.caps and "file_transfer" in link.own_caps:
++                    self._callback("file", link, message)
+             elif kind == protocol.MSG_ARRANGEMENT:
+                 read = protocol.read_arrangement_v6(message, time.time())
+                 if read is not None:
+@@ -1224,6 +1238,8 @@ class LinkResponder:
+             self._inject_timed_locked(link, dict(move, dx=scaled_dx, dy=scaled_dy), scaled=True)
+ 
+     def _apply_input_locked(self, link, read, after):
++        if read["type"] == protocol.MSG_MOUSEUP and read.get("button") == "left":
++            after.append(lambda: self._callback("file_drag_release", link))
+         zones_at = time.monotonic()
+         consumed = read["type"] == protocol.MSG_MOUSEMOVE and self._zones_locked(link, read, after)
+         link.timing.add("zones", time.monotonic() - zones_at)
+@@ -1485,6 +1501,15 @@ class LinkResponder:
+                 after.append(lambda: self._callback("pressure", model.edge, outcome.pressure, False, part))
+                 return True
+             offset = corner_offset(model.corner, model.edge) if isinstance(model, crossing.CornerPush) else outcome.offset
++            if (("button", "left") in link.held and "file_transfer" in link.caps
++                    and "file_transfer" in link.own_caps and self._callbacks["file_drag_edge"] is not None):
++                model.reset()
++                now = time.monotonic()
++                if now - getattr(link, "file_drag_probe_at", float("-inf")) >= 0.25:
++                    link.file_drag_probe_at = now
++                    after.append(lambda: self._callback("file_drag_edge", link, peer, outcome.edge, offset,
++                                                        outcome.display, outcome.side))
++                return True
+             # Built before disarming: a switch that cannot be built must not leave this machine with
+             # no way out until the next focus (rc12, 10-10-2026).
+             try:
+@@ -1507,6 +1532,22 @@ class LinkResponder:
+             return True
+         return False
+ 
++    def file_drag_held(self, link):
++        with self._lock:
++            return self._owner is link and ("button", "left") in link.held and not link.closed.is_set()
++
++    def file_drag_cross(self, link, peer, edge, offset, display=None, side=None):
++        """Send a prepared file drag across while this link still holds the button."""
++        with self._lock:
++            if self._owner is not link or ("button", "left") not in link.held or link.closed.is_set():
++                return False
++            try:
++                message = protocol.switch_v6(link.route, peer, edge, offset, display=display, side=side)
++            except ValueError:
++                return False
++            self._disarm_locked()
++            return link.post(message)
++
+     def rearm(self) -> None:
+         """Rebuilds the zones from the settings as they are now, while an owner drives and they are
+         live, so a change on the Crossing page applies at once. Never revives zones spent by a
+diff --git a/core/tests/test_drag_coordinator.py b/core/tests/test_drag_coordinator.py
+new file mode 100644
+index 0000000..026d329
+--- /dev/null
++++ b/core/tests/test_drag_coordinator.py
+@@ -0,0 +1,47 @@
++import threading
++import unittest
++
++from core.drag_coordinator import DragCoordinator
++
++
++class CoordinatorTests(unittest.TestCase):
++    def test_prepares_before_transition_and_native_drag(self):
++        events, done = [], threading.Event()
++        class Handoff:
++            def prepare(self, files):
++                events.append(("prepare", files))
++                return "id"
++            def start_crossing(self, ident):
++                events.append(("start", ident))
++                done.set()
++                return True
++            def cancel(self):
++                events.append(("cancel",))
++        coordinator = DragCoordinator(Handoff(), lambda: True, lambda: events.append(("stop",)),
++                                      lambda edge: events.append(("cross", edge)) or True)
++        self.assertTrue(coordinator.begin(["a"], "right"))
++        self.assertTrue(done.wait(1))
++        self.assertEqual(events, [("prepare", ("a",)), ("stop",), ("cross", "right"), ("start", "id")])
++
++    def test_release_before_preparation_finishes_cancels_without_crossing(self):
++        started, unblock, finished = threading.Event(), threading.Event(), threading.Event()
++        crossed = []
++        class Handoff:
++            def prepare(self, files):
++                started.set()
++                unblock.wait(2)
++                finished.set()
++                return "id"
++            def start_crossing(self, ident):
++                crossed.append("start")
++                return True
++            def cancel(self):
++                return True
++        coordinator = DragCoordinator(Handoff(), lambda: True, lambda: None,
++                                      lambda edge: crossed.append("cross") or True)
++        self.assertTrue(coordinator.begin(["a"], "right"))
++        self.assertTrue(started.wait(1))
++        coordinator.button_released()
++        unblock.set()
++        self.assertTrue(finished.wait(1))
++        self.assertEqual(crossed, [])
+diff --git a/core/tests/test_drag_handoff.py b/core/tests/test_drag_handoff.py
+new file mode 100644
+index 0000000..fc29a79
+--- /dev/null
++++ b/core/tests/test_drag_handoff.py
+@@ -0,0 +1,182 @@
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++
++from core.drag_handoff import DragHandoff, DragLinks, read_drag, read_transfer
++from core.file_transfer import TransferDispatcher
++from core.link import OutboundLink
++from core.tests.responder_harness import B, CAPS, Machine, entry, wait_for
++from core.tests.test_link import Side
++
++
++class HandoffTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.received = []
++        self.ready = threading.Event()
++        links = {}
++        self.source = DragHandoff(lambda message: links["target"].deliver(message), lambda *_: None,
++                                  timeout=2)
++        def native(paths, release):
++            self.received.append((paths, release))
++            self.ready.set()
++        self.target = DragHandoff(lambda message: links["source"].deliver(message), native,
++                                  allow_incoming=lambda: True, timeout=2)
++        links["source"] = TransferDispatcher(self.source, validator=read_transfer)
++        links["target"] = TransferDispatcher(self.target, validator=read_transfer)
++        self.links = links
++        self.addCleanup(self.close)
++
++    def close(self):
++        for dispatcher in self.links.values():
++            dispatcher.close()
++        for dispatcher in self.links.values():
++            dispatcher.wait_closed(2)
++        for _, release in self.received:
++            release()
++
++    def files(self):
++        first = Path(self.temp.name) / "первый.txt"
++        second = Path(self.temp.name) / "second.txt"
++        first.write_bytes(b"first")
++        second.write_bytes(b"second")
++        return [first, second]
++
++    def test_transfers_before_crossing_then_starts_native_drag(self):
++        paths = self.files()
++        ident = self.source.prepare(paths)
++        self.assertFalse(self.ready.is_set())
++        self.assertTrue(self.source.start_crossing(ident))
++        self.assertTrue(self.ready.wait(2))
++        received, release = self.received[0]
++        self.assertEqual([item.name for item in received], [item.name for item in paths])
++        self.assertEqual([item.read_bytes() for item in received], [b"first", b"second"])
++        release()
++        self.assertFalse(received[0].exists())
++
++    def test_declined_peer_does_not_receive_files(self):
++        self.target._allow_incoming = lambda: False
++        with self.assertRaises(ConnectionError):
++            self.source.prepare(self.files())
++        self.assertFalse(self.ready.is_set())
++
++    def test_duplicate_names_are_not_sent(self):
++        path = self.files()[0]
++        with self.assertRaises(ValueError):
++            self.source.prepare([path, path])
++        self.assertFalse(self.ready.is_set())
++
++    def test_disconnect_cleans_staged_files_before_crossing(self):
++        ident = self.source.prepare(self.files())
++        state = self.target._incoming
++        self.assertEqual(state["id"], ident)
++        directory = Path(state["directory"])
++        self.assertTrue(directory.exists())
++        self.target.close()
++        self.assertFalse(directory.exists())
++        self.assertFalse(self.ready.is_set())
++
++    def test_cancel_after_preparation_cleans_staging_and_allows_retry(self):
++        paths = self.files()
++        ident = self.source.prepare(paths)
++        directory = Path(self.target._incoming["directory"])
++        self.assertTrue(self.source.cancel())
++        self.assertFalse(self.source.start_crossing(ident))
++        self.assertTrue(wait_for(lambda: not directory.exists(), 2))
++        second = self.source.prepare(paths)
++        self.assertTrue(self.source.start_crossing(second))
++        self.assertTrue(self.ready.wait(2))
++
++    def test_remote_cancel_during_partial_file_closes_and_cleans_it(self):
++        ident, file_id = "a" * 32, "b" * 32
++        self.target.handle({"type": "drag_begin", "data": {"id": ident, "count": 1}})
++        directory = Path(self.target._incoming["directory"])
++        self.target.handle({"type": "file_offer", "data": {"id": file_id, "name": "part", "size": 3}})
++        self.target.handle({"type": "file_chunk", "data": {"id": file_id, "offset": 0, "bytes": "YQ=="}})
++        self.target.handle({"type": "drag_cancel", "data": {"id": ident}})
++        self.assertFalse(directory.exists())
++        self.assertIsNone(self.target._endpoint._incoming)
++
++    def test_invalid_control_messages_are_rejected(self):
++        self.assertIsNone(read_drag({"type": "drag_begin", "data": {"id": "a" * 32, "count": True}}))
++        self.assertIsNone(read_drag({"type": "drag_begin", "data": {"id": "a" * 32, "count": 33}}))
++        self.assertIsNone(read_drag({"type": "drag_start", "data": {"id": "../", "extra": 1}}))
++
++
++class EncryptedHandoffTests(unittest.TestCase):
++    def test_file_drag_handoff_over_the_real_link(self):
++        caps = list(CAPS) + ["file_transfer"]
++        machine = Machine([entry(B, "Peer")], caps=caps).start()
++        self.addCleanup(machine.stop)
++        targets, target_dispatchers, captured, reverse_captured = {}, {}, [], []
++        native_started = threading.Event()
++        reverse_started = threading.Event()
++        def native(paths, release):
++            captured.append((paths, release))
++            native_started.set()
++        def incoming(link, message):
++            if link not in targets:
++                targets[link] = DragHandoff(link.post, native, allow_incoming=lambda: True, timeout=5)
++                target_dispatchers[link] = TransferDispatcher(targets[link], validator=read_transfer)
++            target_dispatchers[link].deliver(message)
++        machine.responder._callbacks["file"] = incoming
++        side = Side(machine)
++        identity = side.identity
++        side.identity = lambda: identity(caps=caps)
++        holder = {}
++        connection = OutboundLink(side.peer()["token"], side.book, side.identity,
++                                  message=lambda link, message: holder["dispatcher"].deliver(message),
++                                  reconnect_seconds=30)
++        def reverse_native(paths, release):
++            reverse_captured.append((paths, release))
++            reverse_started.set()
++        source = DragHandoff(connection.post, reverse_native, allow_incoming=lambda: True, timeout=5)
++        holder["dispatcher"] = TransferDispatcher(source, validator=read_transfer)
++        connection.start()
++        try:
++            self.assertTrue(wait_for(connection.live, 5))
++            with tempfile.TemporaryDirectory() as directory:
++                path = Path(directory) / "файл.txt"
++                path.write_bytes(b"actual encrypted link")
++                ident = source.prepare([path])
++                self.assertFalse(native_started.is_set())
++                self.assertTrue(source.start_crossing(ident))
++                self.assertTrue(native_started.wait(2))
++                self.assertEqual(captured[0][0][0].read_bytes(), b"actual encrypted link")
++                captured[0][1]()
++                reverse_file = Path(directory) / "обратно.txt"
++                reverse_file.write_bytes(b"reverse encrypted drag")
++                target = next(iter(targets.values()))
++                reverse_id = target.prepare([reverse_file])
++                self.assertTrue(target.start_crossing(reverse_id))
++                self.assertTrue(reverse_started.wait(2))
++                self.assertEqual(reverse_captured[0][0][0].read_bytes(), b"reverse encrypted drag")
++                reverse_captured[0][1]()
++        finally:
++            connection.stop()
++            holder["dispatcher"].close()
++            holder["dispatcher"].wait_closed(2)
++            for dispatcher in target_dispatchers.values():
++                dispatcher.close()
++                dispatcher.wait_closed(2)
++
++
++class DragLinkTests(unittest.TestCase):
++    def test_only_a_valid_begin_creates_a_session_and_disconnect_closes_it(self):
++        class Link:
++            def post(self, message):
++                return True
++        registry = DragLinks(lambda *_: None, allow_incoming=lambda: True, limit=1)
++        link = Link()
++        self.addCleanup(registry.close)
++        self.assertFalse(registry.receive(link, {"type": "drag_start", "data": {"id": "a" * 32}}))
++        self.assertFalse(registry._sessions)
++        self.assertTrue(registry.receive(link, {"type": "drag_begin", "data": {"id": "a" * 32, "count": 1}}))
++        session, dispatcher = registry._sessions[link]
++        self.assertTrue(wait_for(lambda: session._incoming is not None, 2))
++        directory = Path(session._incoming["directory"])
++        registry.disconnect(link)
++        self.assertTrue(dispatcher.wait_closed(2))
++        self.assertFalse(directory.exists())
+diff --git a/core/tests/test_file_drag_receiver.py b/core/tests/test_file_drag_receiver.py
+new file mode 100644
+index 0000000..ee15c41
+--- /dev/null
++++ b/core/tests/test_file_drag_receiver.py
+@@ -0,0 +1,39 @@
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest import mock
++
++from core import protocol, receiver, return_edge
++
++
++class FileDragReceiverTests(unittest.TestCase):
++    def setUp(self):
++        self.edges = []
++        self.responder = receiver.LinkResponder(None, lambda: {}, status_callback=lambda *_: None,
++                                                desktop=mock.Mock(),
++                                                file_drag_edge_callback=lambda *args: self.edges.append(args))
++        self.link = SimpleNamespace(held={("button", "left"): None}, caps={"file_transfer"},
++                                    own_caps={"file_transfer"}, closed=threading.Event(), route=1,
++                                    post=mock.Mock(return_value=True))
++        self.responder._owner = self.link
++        outcome = SimpleNamespace(action=return_edge.CROSS, edge="left", offset=0.5,
++                                  display=None, side=None, pressure=1)
++        self.model = mock.Mock(edge="right")
++        self.model.feed.return_value = outcome
++        self.peer = b"A" * 16
++        self.responder._armed = [(self.peer, self.model)]
++
++    def test_held_file_drag_is_offered_before_switch(self):
++        after = []
++        self.assertTrue(self.responder._zones_locked(self.link, {"dx": 1, "dy": 0}, after,
++                                                    geometry=([], (0, 0), {})))
++        self.link.post.assert_not_called()
++        self.responder._run(after)
++        self.assertEqual(self.edges, [(self.link, self.peer, "left", 0.5, None, None)])
++        self.assertTrue(self.responder.file_drag_cross(self.link, self.peer, "left", 0.5))
++        self.assertEqual(self.link.post.call_args.args[0]["type"], protocol.MSG_SWITCH)
++
++    def test_no_cross_after_mouse_release(self):
++        self.link.held.clear()
++        self.assertFalse(self.responder.file_drag_cross(self.link, self.peer, "left", 0.5))
++        self.link.post.assert_not_called()
+diff --git a/core/tests/test_file_transfer.py b/core/tests/test_file_transfer.py
+new file mode 100644
+index 0000000..5635030
+--- /dev/null
++++ b/core/tests/test_file_transfer.py
+@@ -0,0 +1,255 @@
++import base64
++import hashlib
++import queue
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++
++from core.file_transfer import IncomingFile, MAX_CHUNK_BYTES, TransferDispatcher, TransferEndpoint, file_records, read_record, valid_name
++
++
++class IncomingFileTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.directory = Path(self.temp.name)
++
++    def test_ordered_file_is_published_after_verification(self):
++        content = b"x" * MAX_CHUNK_BYTES + b"end"
++        with IncomingFile(self.directory, "тест.txt", len(content)) as transfer:
++            transfer.write(0, content[:MAX_CHUNK_BYTES])
++            transfer.write(MAX_CHUNK_BYTES, content[MAX_CHUNK_BYTES:])
++            self.assertFalse((self.directory / "тест.txt").exists())
++            result = transfer.finish(hashlib.sha256(content).hexdigest())
++        self.assertEqual(result.read_bytes(), content)
++        self.assertEqual(list(self.directory.iterdir()), [result])
++
++    def test_existing_file_is_never_replaced(self):
++        destination = self.directory / "file.txt"
++        destination.write_bytes(b"original")
++        with self.assertRaises(FileExistsError):
++            with IncomingFile(self.directory, destination.name, 3) as transfer:
++                transfer.write(0, b"new")
++                transfer.finish(hashlib.sha256(b"new").hexdigest())
++        self.assertEqual(destination.read_bytes(), b"original")
++        self.assertEqual(list(self.directory.iterdir()), [destination])
++
++    def test_bad_checksum_and_cancel_leave_no_file(self):
++        with self.assertRaises(ValueError):
++            with IncomingFile(self.directory, "file", 3) as transfer:
++                transfer.write(0, b"abc")
++                transfer.finish("0" * 64)
++        self.assertEqual(list(self.directory.iterdir()), [])
++        with IncomingFile(self.directory, "file", 3) as transfer:
++            transfer.write(0, b"ab")
++        self.assertEqual(list(self.directory.iterdir()), [])
++
++    def test_bad_chunks_are_rejected(self):
++        with IncomingFile(self.directory, "file", 3) as transfer:
++            for offset, data in ((1, b"x"), (0, b""), (0, b"abcd"), (0, b"x" * (MAX_CHUNK_BYTES + 1))):
++                with self.subTest(offset=offset, size=len(data)), self.assertRaises(ValueError):
++                    transfer.write(offset, data)
++        self.assertEqual(list(self.directory.iterdir()), [])
++
++    def test_names_are_portable_and_cannot_escape_the_directory(self):
++        for name in ("", ".", "..", "../a", "a\\b", "C:foo", "nul.txt", "file.", "a\x00b", "\ud800"):
++            with self.subTest(name=repr(name)):
++                self.assertFalse(valid_name(name))
++        self.assertTrue(valid_name("фото 1.png"))
++
++    def test_empty_file(self):
++        with IncomingFile(self.directory, "empty", 0) as transfer:
++            path = transfer.finish(hashlib.sha256(b"").hexdigest())
++        self.assertEqual(path.read_bytes(), b"")
++
++
++class TransferRecordTests(unittest.TestCase):
++    def test_valid_records_and_bounded_chunks(self):
++        ident = "a" * 32
++        chunk = b"z" * MAX_CHUNK_BYTES
++        records = (
++            {"type": "file_offer", "data": {"id": ident, "name": "фото.png", "size": len(chunk)}},
++            {"type": "file_chunk", "data": {"id": ident, "offset": 0, "bytes": base64.b64encode(chunk).decode()}},
++            {"type": "file_finish", "data": {"id": ident, "sha256": hashlib.sha256(chunk).hexdigest()}},
++            {"type": "file_cancel", "data": {"id": ident}},
++        )
++        for record in records:
++            with self.subTest(kind=record["type"]):
++                self.assertIsNotNone(read_record(record))
++        self.assertEqual(read_record(records[1])["bytes"], chunk)
++
++    def test_untrusted_records_are_rejected(self):
++        ident = "a" * 32
++        records = (None, {}, {"type": "file_offer", "data": {"id": ident, "name": "../x", "size": 3}},
++                   {"type": "file_offer", "data": {"id": ident, "name": "x", "size": True}},
++                   {"type": "file_chunk", "data": {"id": ident, "offset": 0, "bytes": "!!!!"}},
++                   {"type": "file_chunk", "data": {"id": ident, "offset": 0, "bytes": "a" * 100000}},
++                   {"type": "file_finish", "data": {"id": ident, "sha256": "0" * 63}},
++                   {"type": "file_cancel", "data": {"id": ident, "unexpected": 1}})
++        for record in records:
++            with self.subTest(record=str(record)[:100]):
++                self.assertIsNone(read_record(record))
++
++    def test_sender_and_receiver_round_trip(self):
++        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as dest_dir:
++            source = Path(source_dir) / "документ.bin"
++            content = bytes(range(256)) * 257
++            source.write_bytes(content)
++            records = iter(file_records(source, "1" * 32))
++            offer = read_record(next(records))
++            with IncomingFile(dest_dir, offer["name"], offer["size"]) as incoming:
++                for message in records:
++                    record = read_record(message)
++                    if record["type"] == "file_chunk":
++                        incoming.write(record["offset"], record["bytes"])
++                    else:
++                        result = incoming.finish(record["sha256"])
++            self.assertEqual(result.read_bytes(), content)
++
++    def test_sender_rejects_symbolic_links(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            real = root / "real"
++            real.write_text("test")
++            link = root / "alias"
++            try:
++                link.symlink_to(real)
++            except (OSError, NotImplementedError):
++                self.skipTest("this environment cannot create symbolic links")
++            with self.assertRaises(ValueError):
++                next(file_records(link, "a" * 32))
++
++
++class EndpointTests(unittest.TestCase):
++    def setUp(self):
++        self.src = tempfile.TemporaryDirectory()
++        self.dst = tempfile.TemporaryDirectory()
++        self.addCleanup(self.src.cleanup)
++        self.addCleanup(self.dst.cleanup)
++        self.messages = queue.Queue()
++        self.done = []
++        self.left = TransferEndpoint(lambda m: self.enqueue("right", m), lambda *_: None, timeout=2)
++        self.right = TransferEndpoint(lambda m: self.enqueue("left", m), lambda *_: self.dst.name,
++                                      self.done.append, timeout=2)
++        self.stopping = threading.Event()
++        self.worker = threading.Thread(target=self.pump, daemon=True)
++        self.worker.start()
++        self.addCleanup(self.stop)
++
++    def enqueue(self, target, message):
++        self.messages.put((target, message))
++        return True
++
++    def pump(self):
++        while not self.stopping.is_set():
++            try:
++                target, message = self.messages.get(timeout=0.05)
++            except queue.Empty:
++                continue
++            getattr(self, target).handle(message)
++
++    def stop(self):
++        self.left.close()
++        self.right.close()
++        self.stopping.set()
++        self.worker.join(2)
++
++    def test_transfer_over_ordered_messages(self):
++        path = Path(self.src.name) / "пример.txt"
++        content = bytes(range(256)) * 513
++        path.write_bytes(content)
++        self.assertEqual(self.left.send_file(path), len(content))
++        self.assertEqual((Path(self.dst.name) / path.name).read_bytes(), content)
++        self.assertEqual(self.done, [Path(self.dst.name) / path.name])
++
++    def test_refused_offer_leaves_no_file(self):
++        self.right._accept = lambda *_: None
++        path = Path(self.src.name) / "x"
++        path.write_bytes(b"data")
++        with self.assertRaises(ConnectionError):
++            self.left.send_file(path)
++        self.assertEqual(list(Path(self.dst.name).iterdir()), [])
++
++    def test_existing_destination_is_not_overwritten(self):
++        path = Path(self.src.name) / "x"
++        path.write_bytes(b"new")
++        destination = Path(self.dst.name) / "x"
++        destination.write_bytes(b"old")
++        with self.assertRaises(ConnectionError):
++            self.left.send_file(path)
++        self.assertEqual(destination.read_bytes(), b"old")
++        self.assertEqual(list(Path(self.dst.name).iterdir()), [destination])
++
++    def test_disconnect_cleans_partial_file(self):
++        ident = "a" * 32
++        self.right.handle({"type": "file_offer", "data": {"id": ident, "name": "x", "size": 2}})
++        self.right.handle({"type": "file_chunk", "data": {"id": ident, "offset": 0, "bytes": "YQ=="}})
++        self.right.close()
++        self.assertEqual(list(Path(self.dst.name).iterdir()), [])
++
++
++class DispatcherTests(unittest.TestCase):
++    def test_local_cancellation_interrupts_a_waiting_sender(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "test.txt"
++            path.write_text("test")
++            offered, sent, errors = threading.Event(), [], []
++            def post(message):
++                sent.append(message)
++                if message["type"] == "file_offer":
++                    offered.set()
++                return True
++            endpoint = TransferEndpoint(post, lambda *_: None, timeout=5)
++            def send():
++                try:
++                    endpoint.send_file(path)
++                except Exception as exc:
++                    errors.append(exc)
++            worker = threading.Thread(target=send)
++            worker.start()
++            try:
++                self.assertTrue(offered.wait(1))
++                self.assertTrue(endpoint.cancel_outgoing())
++                worker.join(2)
++                self.assertFalse(worker.is_alive())
++                self.assertIsInstance(errors[0], ConnectionError)
++                self.assertTrue(any(message["type"] == "file_cancel" for message in sent))
++            finally:
++                endpoint.close()
++                worker.join(2)
++
++    def test_slow_storage_does_not_block_the_link_reader(self):
++        entered, release = threading.Event(), threading.Event()
++        class SlowEndpoint:
++            def handle(self, message):
++                entered.set()
++                release.wait(2)
++            def close(self):
++                pass
++        dispatcher = TransferDispatcher(SlowEndpoint(), max_pending=1)
++        message = {"type": "file_cancel", "data": {"id": "a" * 32}}
++        try:
++            self.assertTrue(dispatcher.deliver(message))
++            self.assertTrue(entered.wait(1))
++            self.assertTrue(dispatcher.deliver(message))
++            self.assertFalse(dispatcher.deliver(message))
++        finally:
++            release.set()
++            dispatcher.close()
++            self.assertTrue(dispatcher.wait_closed(2))
++
++    def test_close_cleans_partial_file(self):
++        with tempfile.TemporaryDirectory() as directory:
++            accepted = threading.Event()
++            def accept(*_):
++                accepted.set()
++                return directory
++            endpoint = TransferEndpoint(lambda message: True, accept)
++            dispatcher = TransferDispatcher(endpoint)
++            self.assertTrue(dispatcher.deliver({"type": "file_offer", "data": {
++                "id": "a" * 32, "name": "partial", "size": 10}}))
++            self.assertTrue(accepted.wait(1))
++            dispatcher.close()
++            self.assertTrue(dispatcher.wait_closed(2))
++            self.assertEqual(list(Path(directory).iterdir()), [])
+diff --git a/core/tests/test_file_transfer_link.py b/core/tests/test_file_transfer_link.py
+new file mode 100644
+index 0000000..b007732
+--- /dev/null
++++ b/core/tests/test_file_transfer_link.py
+@@ -0,0 +1,69 @@
++"""Transfers through the real authenticated Beamer v6 link on loopback."""
++import tempfile
++import unittest
++from pathlib import Path
++
++from core.file_transfer import TransferDispatcher, TransferEndpoint
++from core.link import OutboundLink
++from core.tests.responder_harness import B, CAPS, Machine, entry, wait_for
++from core.tests.test_link import Side
++
++
++class FileTransferLinkTests(unittest.TestCase):
++    def test_transfer_over_encrypted_link(self):
++        caps = list(CAPS) + ["file_transfer"]
++        machine = Machine([entry(B, "Peer")], caps=caps).start()
++        self.addCleanup(machine.stop)
++        source_dir = tempfile.TemporaryDirectory()
++        destination_dir = tempfile.TemporaryDirectory()
++        self.addCleanup(source_dir.cleanup)
++        self.addCleanup(destination_dir.cleanup)
++        received = []
++        destination = {}
++        destination_dispatch = {}
++
++        def file_message(link, message):
++            if link not in destination:
++                destination[link] = TransferEndpoint(link.post, lambda *_: destination_dir.name,
++                                                     received.append, timeout=4)
++                destination_dispatch[link] = TransferDispatcher(destination[link])
++            destination_dispatch[link].deliver(message)
++
++        machine.responder._callbacks["file"] = file_message
++        side = Side(machine)
++        original_identity = side.identity
++        side.identity = lambda: original_identity(caps=caps)
++        sender = {}
++        connection = OutboundLink(side.peer()["token"], side.book, side.identity,
++                                  message=lambda link, message: sender["dispatcher"].deliver(message),
++                                  reconnect_seconds=30)
++        endpoint = TransferEndpoint(connection.post, lambda *_: source_dir.name, timeout=4)
++        sender["dispatcher"] = TransferDispatcher(endpoint)
++        self.addCleanup(sender["dispatcher"].close)
++        self.addCleanup(connection.stop)
++        connection.start()
++        self.assertTrue(wait_for(connection.live, 5))
++        source = Path(source_dir.name) / "проверка.txt"
++        content = bytes(range(256)) * 512
++        source.write_bytes(content)
++        self.assertEqual(endpoint.send_file(source), len(content))
++        self.assertTrue(wait_for(lambda: bool(received), 2))
++        self.assertEqual(received[0].read_bytes(), content)
++        reverse_source = Path(destination_dir.name) / "обратно.txt"
++        reverse_source.write_bytes(b"reverse transfer")
++        remote = next(iter(destination.values()))
++        self.assertEqual(remote.send_file(reverse_source), len(b"reverse transfer"))
++        self.assertEqual((Path(source_dir.name) / reverse_source.name).read_bytes(), b"reverse transfer")
++        for dispatcher in destination_dispatch.values():
++            dispatcher.close()
++            self.assertTrue(dispatcher.wait_closed(2))
++
++    def test_incapable_peer_rejects_transfer_post(self):
++        machine = Machine([entry(B, "Peer")]).start()
++        self.addCleanup(machine.stop)
++        side = Side(machine)
++        connection = side.link()
++        self.addCleanup(connection.stop)
++        connection.start()
++        self.assertTrue(wait_for(connection.live, 5))
++        self.assertFalse(connection.post({"type": "file_cancel", "data": {"id": "a" * 32}}))
+diff --git a/core/tests/test_owner.py b/core/tests/test_owner.py
+index ea362c5..31c2144 100644
+--- a/core/tests/test_owner.py
++++ b/core/tests/test_owner.py
+@@ -75,6 +75,24 @@ class OwnerCase(unittest.TestCase):
+         self.assertEqual(self.o.accept(peer, {"route": self.o.route}), [])
+         return actions
+ 
++    def test_explicit_file_drag_hands_a_held_button_to_the_peer(self):
++        self.assertEqual(self.o.input(button("mousedown")), [LOCAL])
++        self.take("B")
++        self.assertEqual(sent(self.o.adopt_local_button("left")), [("B", button("mousedown"))])
++        self.assertEqual(sent(self.o.input(button("mouseup"))), [("B", button("mouseup"))])
++        self.assertEqual(self.o.adopt_local_button("left"), [])
++
++    def test_a_button_cannot_be_adopted_without_a_local_press_or_peer(self):
++        self.assertEqual(self.o.adopt_local_button("left"), [])
++        self.take("B")
++        self.assertEqual(self.o.adopt_local_button("left"), [])
++
++    def test_adopted_button_is_released_if_input_returns_home(self):
++        self.o.input(button("mousedown"))
++        self.take("B")
++        self.o.adopt_local_button("left")
++        self.assertIn(("B", button("mouseup")), sent(self.o.go(None)))
++
+     def switch(self, frm, nxt, route=None, **where):
+         return self.o.switch(frm, {"route": self.o.route if route is None else route, "next": nxt, **where})
+ 
+diff --git a/docs/file-drag-preview.md b/docs/file-drag-preview.md
+new file mode 100644
+index 0000000..75c070f
+--- /dev/null
++++ b/docs/file-drag-preview.md
+@@ -0,0 +1,27 @@
++# File drag preview
++
++This preview adds the `file_transfer` capability to the existing authenticated
++v6 connection. Peers without that capability retain the existing crossing
++behavior. The source stages the complete selection on the peer before it
++crosses the pointer and requests a native drag. A release before the handoff
++cancels the pending transfer. The implementation supports up to 32 regular
++files with at most 10 GiB in total; directories and symbolic links are not
++supported.
++
++`drag_begin` identifies a random 128-bit drag ID and file count. After the
++peer acknowledges it, each file uses `file_offer`, `file_chunk`, and
++`file_finish`, with a separate random 128-bit file ID, sequential offsets,
++at most 32 KiB per chunk, and a SHA-256 digest. Each step is acknowledged;
++this bounds buffering. File names are single portable names rather than paths.
++`drag_ready` is acknowledged after all files arrive, and `drag_start` asks the
++target to begin its platform drag only after the source has handed over input.
++`drag_cancel` and `file_cancel` end the corresponding pending operation.
++
++Received bytes are staged in a temporary directory. A verified file is
++published there without overwriting an existing entry. Cancelled or incomplete
++transfers are removed. Successfully dropped staging files are retained because
++the destination application may copy them asynchronously after the drag loop
++returns. No assumption is made that this indicates the copy has completed.
++
++The native Finder and Windows Explorer integration must be tested on actual
++macOS and Windows desktops before this preview is treated as a release.
+diff --git a/mac_app/bridge.py b/mac_app/bridge.py
+index 5c6c5b5..ed376e1 100644
+--- a/mac_app/bridge.py
++++ b/mac_app/bridge.py
+@@ -34,8 +34,13 @@ from core import identify_screens
+ import frame_clock
+ import keyboard_layout
+ import fn_language
++import file_drag_mac
++import input_injector_mac
+ import media_keys
+ from core import keyboard_sync
++from core import file_transfer
++from core import drag_handoff
++from core import drag_coordinator
+ from core import keytable
+ from core import link as link_module
+ from core import owner as owner_module
+@@ -82,7 +87,7 @@ ROUND_TRIP_MAX_AGE_SECONDS = 5.0
+ # the ownership by force after one second), then goes ahead.
+ LET_GO_WAIT_SECONDS = 1.3
+ OWN_PLATFORM = "macos"
+-CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language")
++CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language", "file_transfer")
+ MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"})
+ 
+ # Why input came home, in words, for the alert. A why that is not here comes home quietly.
+@@ -621,6 +626,14 @@ class KVMController:
+         self.on_arrangement = None
+         self.on_settings = None
+         self.on_paired = None
++        self.on_file_transfer = None
++        self.on_file_drag = None
++        self.on_file_drag_cancel = None
++        self._file_drag_detector = file_drag_mac.DragDetector()
++        # The source-side handler is installed only after the platform service
++        # is explicitly enabled; the existing input behavior stays unchanged.
++        self._file_drag_links = None
++        self._file_drag_coordinator = None
+         # What to send a peer the moment its link is up: the app's own messages, of which only the
+         # settings state goes on to a peer that keeps it (the arrangement and `paired` are made here).
+         self.announce = lambda: []
+@@ -1250,6 +1263,10 @@ class KVMController:
+ 
+     def stop(self):
+         self.idle_pointer.cancel()
++        if getattr(self, "_file_drag_coordinator", None) is not None:
++            self._file_drag_coordinator.close()
++        if getattr(self, "_file_drag_links", None) is not None:
++            self._file_drag_links.close()
+         self._return_local()
+         # The let-go and what is ahead of it may be waiting behind a clipboard read: sent first.
+         deadline = time.monotonic() + 1.0
+@@ -1846,6 +1863,13 @@ class KVMController:
+                     self._repair_redirecting_disagreement()
+                     return event
+                 button = self.translator.button_of(event_type, event)
++                if button == ("left", False):
++                    detector = getattr(self, "_file_drag_detector", None)
++                    if detector is not None:
++                        detector.update(False)
++                    cancel_drag = getattr(self, "on_file_drag_cancel", None)
++                    if cancel_drag is not None:
++                        cancel_drag()
+                 if not self.redirecting:
+                     if button is not None:
+                         if button[1]:
+@@ -1939,6 +1963,100 @@ class KVMController:
+         except Exception:
+             return False
+ 
++    def enable_file_drag_source(self):
++        """Connect Finder gestures and native targets to file handoff links."""
++        if getattr(self, "_file_drag_links", None) is not None:
++            return
++        self._file_drag_host = file_drag_mac.NativeDragHost()
++        self._file_drag_links = drag_handoff.DragLinks(self._file_drag_host.begin, allow_incoming=lambda: True)
++        self.on_file_transfer = self._receive_file_drag
++        self.on_file_drag = self._begin_file_drag
++        self.on_file_drag_cancel = self._cancel_file_drag
++
++    def _begin_file_drag(self, paths, step, peer):
++        peer = peer or self._shortcut_peer()
++        link = self._peers_up.get(peer)
++        if link is None or "file_transfer" not in link.caps or not link.live():
++            return False
++        coordinator = self._file_drag_coordinator
++        if coordinator is None or getattr(coordinator, "_peer", None) != peer:
++            if coordinator is not None:
++                coordinator.close()
++            session = self._file_drag_links.session(link, post=self._file_drag_post(link, peer))
++            coordinator = drag_coordinator.DragCoordinator(
++                session, lambda: ("button", "left") in self._home_presses,
++                lambda: None, lambda item: self._cross_file_drag(peer, item))
++            coordinator._peer = peer
++            self._file_drag_coordinator = coordinator
++        return coordinator.begin(paths, step)
++
++    def _file_drag_post(self, link, peer):
++        def ordered_post(message):
++            if self._peers_up.get(peer) is not link or not link.live():
++                return False
++            # Use the same ordering as focus and input, including any
++            # clipboard operation that is still ahead of the crossing.
++            with self._owner_lock:
++                self._execute([owner_module.Send(peer, message)])
++            return True
++        return ordered_post
++
++    def _receive_file_drag(self, link, message):
++        peer = link.peer_id
++        self._file_drag_links.session(link, post=self._file_drag_post(link, peer))
++        return self._file_drag_links.receive(link, message)
++
++    def _cancel_file_drag(self):
++        coordinator = self._file_drag_coordinator
++        if coordinator is not None:
++            coordinator.button_released()
++
++    def _cross_file_drag(self, peer, step):
++        """Perform the transition on the tap's run loop, ordered with mouse-up."""
++        run_loop = self.tap_run_loop
++        if run_loop is None or self.stop_event.is_set():
++            return False
++        completed, abandoned = threading.Event(), threading.Event()
++        result = []
++
++        def transition():
++            try:
++                if abandoned.is_set() or ("button", "left") not in self._home_presses:
++                    result.append(False)
++                    return
++                # Escape ends the source Finder drag; the actual physical
++                # button remains held and is handed to the peer below.
++                input_injector_mac.inject_key("esc", True)
++                input_injector_mac.inject_key("esc", False)
++                switched = self.set_redirecting(True, edge=step.edge, offset=step.offset,
++                                                 peer=peer, reason="edge",
++                                                 display=getattr(step, "display", None),
++                                                 side=getattr(step, "side", None))
++                if not switched:
++                    result.append(False)
++                    return
++                self._home_presses.discard(("button", "left"))
++                self._step(lambda owner: owner.input({"type": protocol.MSG_MOUSEDOWN,
++                                                     "data": {"button": "left"}}))
++                result.append(True)
++            except Exception:
++                self.logger.exception("could not hand the held button to the peer")
++                self._return_local()
++                result.append(False)
++            finally:
++                completed.set()
++
++        try:
++            self.quartz.CFRunLoopPerformBlock(run_loop, self.quartz.kCFRunLoopCommonModes, transition)
++            self.quartz.CFRunLoopWakeUp(run_loop)
++        except Exception:
++            self.logger.exception("could not schedule the Finder drag handoff")
++            return False
++        if not completed.wait(2.0):
++            abandoned.set()
++            return False
++        return bool(result and result[0])
++
+     def _handle_local_mouse(self, event_type, event):
+         """Crossing lives on the local side of the tap: while the pointer is
+         pushing against an armed edge, the event is swallowed and the pointer
+@@ -1949,6 +2067,14 @@ class KVMController:
+         CROSSING_RETRY_SECONDS or until the next settings save, so one broken
+         geometry call cannot log an exception per mouse move -- and a passing
+         one cannot leave the edge dead until someone thinks to save a setting."""
++        drag_callback = getattr(self, "on_file_drag", None)
++        paths = ()
++        left_drag = event_type == getattr(self.quartz, "kCGEventLeftMouseDragged", object())
++        detector = getattr(self, "_file_drag_detector", None)
++        supported = any("file_transfer" in getattr(link, "caps", ())
++                        for link in self._peers_up.values())
++        if drag_callback is not None and detector is not None and supported:
++            paths = detector.update(left_drag)
+         if self.home_hold.blocks(self.clock()):
+             if event_type in self.translator.movement_event_types:
+                 self.home_hold.motion(self.clock())
+@@ -1980,6 +2106,11 @@ class KVMController:
+             x, y = location[0], location[1]
+             dx = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaX)
+             dy = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaY)
++            def file_ready(peer):
++                link = self._link_of(peer) if peer is not None else self._primary_link
++                return self._crossing_ready(peer) and link is not None and "file_transfer" in link.caps
++
++            file_drag = bool(left_drag and paths and drag_callback is not None)
+             step = self.crossing.feed(
+                 x,
+                 y,
+@@ -1988,11 +2119,11 @@ class KVMController:
+                 self._current_desktop_bounds(),
+                 self.clock(),
+                 notch_range=self.notch_range,
+-                dragging=event_type != quartz.kCGEventMouseMoved,
++                dragging=event_type != quartz.kCGEventMouseMoved and not file_drag,
+                 # Each display's own edges count where nothing lies beyond them, and Part of the
+                 # edge measures its thirds along the pointer's display.
+                 displays=self._current_displays(),
+-                ready=self._crossing_ready,
++                ready=file_ready if file_drag else self._crossing_ready,
+             )
+         except Exception:
+             self._crossing_failed = True
+@@ -2001,6 +2132,15 @@ class KVMController:
+             self.logger.exception("crossing failed; edge switching is off for %.0fs", CROSSING_RETRY_SECONDS)
+             return event
+         if step.crossed:
++            if file_drag:
++                # The source drag remains local until its staged files are
++                # ready. The callback must return quickly and do I/O elsewhere.
++                try:
++                    drag_callback(paths, step, self._zone_peer(step))
++                except Exception:
++                    self.logger.exception("could not start the file drag handoff")
++                self.crossing.reset()
++                return event
+             if self.receiving:
+                 # Another machine is driving this Mac and this Mac's own pointer pushed through:
+                 # that machine's input goes home first, and this Mac's follows it across once it
+@@ -2368,6 +2508,8 @@ class KVMController:
+ 
+     def _drop_up(self, link):
+         """The link is no longer one this Mac can send on: forget it and tell the owner."""
++        if self._file_drag_links is not None:
++            self._file_drag_links.disconnect(link)
+         peer = link.peer_id
+         if peer and self._peers_up.get(peer) is link:
+             self._peers_up.pop(peer, None)
+@@ -2534,6 +2676,9 @@ class KVMController:
+                     # Rebuilt from what was read: the owner sends it on to the machine input is on.
+                     clean = protocol.clipboard_msg(read["text"], read["image"])
+                     self._step(lambda owner: owner.clipboard_arrived(peer, began, clean))
++            elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
++                if "file_transfer" in link.caps and self.on_file_transfer is not None:
++                    self.on_file_transfer(link, message)
+             elif kind == protocol.MSG_ARRANGEMENT:
+                 self._handle_arrangement(message, peer)
+             elif kind == protocol.MSG_SETTINGS:
+diff --git a/mac_app/file_drag_mac.py b/mac_app/file_drag_mac.py
+new file mode 100644
+index 0000000..26b787c
+--- /dev/null
++++ b/mac_app/file_drag_mac.py
+@@ -0,0 +1,221 @@
++"""Read actual file URLs from the macOS drag pasteboard at a crossing.
++
++This does not itself start a transfer or change the source drag session.
++The caller must only invoke it for a user-initiated file drag.
++"""
++
++import os
++import threading
++import time
++
++try:
++    import AppKit
++    import Quartz
++    from Foundation import NSURL
++    from PyObjCTools import AppHelper
++except ImportError:  # Allows platform-independent unit tests.
++    AppKit = None
++    Quartz = None
++    NSURL = None
++    AppHelper = None
++
++
++def dragged_file_paths():
++    """Return local regular files from the drag pasteboard, or an empty list.
++
++    Do not fall back to the general clipboard: its files can be unrelated to
++    the gesture. Folder and promised-file handling remain separate.
++    """
++    if AppKit is None or NSURL is None:
++        return []
++    try:
++        board = AppKit.NSPasteboard.pasteboardWithName_(AppKit.NSPasteboardNameDrag)
++        urls = board.readObjectsForClasses_options_(
++            [NSURL], {AppKit.NSPasteboardURLReadingFileURLsOnlyKey: True}) or []
++        paths = []
++        for url in urls:
++            if not url.isFileURL():
++                return []
++            path = str(url.path())
++            if not os.path.isabs(path) or not os.path.isfile(path) or os.path.islink(path):
++                return []
++            paths.append(path)
++        return paths
++    except Exception:
++        return []
++
++
++class DragDetector:
++    """Read the drag pasteboard off the input tap and discard stale results."""
++
++    def __init__(self, read=dragged_file_paths):
++        self._read = read
++        self._lock = threading.Lock()
++        self._generation = 0
++        self._active = False
++        self._reading = False
++        self._last_read = float("-inf")
++        self._paths = ()
++
++    def update(self, dragging):
++        with self._lock:
++            if not dragging:
++                if self._active:
++                    self._generation += 1
++                self._active = False
++                self._paths = ()
++                self._reading = False
++                return ()
++            if not self._active:
++                self._active = True
++                self._generation += 1
++                self._last_read = float("-inf")
++            if not self._paths and not self._reading and time.monotonic() - self._last_read >= 0.1:
++                generation = self._generation
++                self._reading = True
++                self._last_read = time.monotonic()
++                threading.Thread(target=self._read_async, args=(generation,),
++                                 name="Beamer-drag-pasteboard", daemon=True).start()
++            return self._paths
++
++    def _read_async(self, generation):
++        try:
++            paths = tuple(self._read())
++        except Exception:
++            paths = ()
++        with self._lock:
++            if self._active and generation == self._generation:
++                self._paths = paths
++                self._reading = False
++
++
++def start_drag(view, mouse_down, source, paths):
++    """Start an AppKit copy drag from an NSView on the main thread.
++
++    The application supplies the actual mouse-down event and an object
++    implementing NSDraggingSource. Paths must remain valid for the duration of
++    the session. Returns AppKit's session, or None if it cannot be started.
++    """
++    if AppKit is None or NSURL is None or mouse_down is None or not paths:
++        return None
++    if not all(os.path.isabs(p) and os.path.isfile(p) and not os.path.islink(p) for p in paths):
++        raise ValueError("drag requires local files")
++    items = []
++    workspace = AppKit.NSWorkspace.sharedWorkspace()
++    point = view.convertPoint_fromView_(mouse_down.locationInWindow(), None)
++    for path in paths:
++        filename = os.fspath(path)
++        item = AppKit.NSDraggingItem.alloc().initWithPasteboardWriter_(NSURL.fileURLWithPath_(filename))
++        icon = workspace.iconForFile_(filename)
++        item.setDraggingFrame_contents_(AppKit.NSMakeRect(point.x - 16, point.y - 16, 32, 32), icon)
++        items.append(item)
++    return view.beginDraggingSessionWithItems_event_source_(items, mouse_down, source)
++
++
++if AppKit is not None:
++    class _NativeDragView(AppKit.NSView):
++        def acceptsFirstMouse_(self, event):
++            return True
++
++        def mouseDown_(self, event):
++            self.host._mouse_down(self, event)
++
++        def draggingSession_sourceOperationMaskForDraggingContext_(self, session, context):
++            return AppKit.NSDragOperationCopy
++
++        def draggingSession_endedAtPoint_operation_(self, session, point, operation):
++            self.host._ended(operation)
++
++
++class NativeDragHost:
++    """Start a Finder-compatible drag on AppKit's main thread.
++
++    An incoming peer mouse-down must already be held. A small, temporary
++    borderless panel receives a marked synthetic mouse-down, which supplies
++    the real NSEvent needed to start an AppKit drag session. Files are retained
++    after a successful drop because the destination may still be copying them.
++    """
++
++    def __init__(self):
++        self._pending = None
++        self._panel = None
++        self._view = None
++        self._generation = 0
++        self.retained = []
++
++    def begin(self, paths, release):
++        if AppHelper is None:
++            release()
++            return
++        AppHelper.callAfter(self._begin_main, tuple(paths), release)
++
++    def _begin_main(self, paths, release):
++        if self._pending is not None or Quartz is None:
++            release()
++            return
++        if not Quartz.CGEventSourceButtonState(Quartz.kCGEventSourceStateCombinedSessionState,
++                                               Quartz.kCGMouseButtonLeft):
++            release()
++            return
++        self._generation += 1
++        generation = self._generation
++        self._pending = (paths, release, False)
++        try:
++            point = AppKit.NSEvent.mouseLocation()
++            rect = AppKit.NSMakeRect(point.x - 8, point.y - 8, 16, 16)
++            style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
++            panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
++                rect, style, AppKit.NSBackingStoreBuffered, False)
++            panel.setLevel_(AppKit.NSStatusWindowLevel)
++            panel.setOpaque_(False)
++            panel.setBackgroundColor_(AppKit.NSColor.clearColor())
++            panel.setHasShadow_(False)
++            view = _NativeDragView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 16, 16))
++            view.host = self
++            panel.setContentView_(view)
++            self._panel, self._view = panel, view
++            panel.orderFrontRegardless()
++            import input_injector_mac
++            input_injector_mac.inject_mouse_button("left", True)
++            timer = threading.Timer(2.0, lambda: AppHelper.callAfter(self._expire, generation))
++            timer.daemon = True
++            timer.start()
++        except Exception:
++            self._fail()
++
++    def _mouse_down(self, view, event):
++        if self._pending is None or self._pending[2]:
++            return
++        paths, release, _ = self._pending
++        try:
++            self._pending = (paths, release, True)
++            if start_drag(view, event, view, paths) is None:
++                self._fail()
++        except Exception:
++            self._fail()
++
++    def _expire(self, generation):
++        if self._generation == generation and self._pending is not None and not self._pending[2]:
++            self._fail()
++
++    def _ended(self, operation):
++        if self._pending is None:
++            return
++        paths, release, _ = self._pending
++        self._pending = None
++        self._close_panel()
++        if operation == AppKit.NSDragOperationNone:
++            release()
++        else:
++            self.retained.append((paths, release))
++
++    def _fail(self):
++        pending, self._pending = self._pending, None
++        self._close_panel()
++        if pending is not None:
++            pending[1]()
++
++    def _close_panel(self):
++        panel, self._panel, self._view = self._panel, None, None
++        if panel is not None:
++            panel.orderOut_(None)
+diff --git a/mac_app/kvm_bridge_app.py b/mac_app/kvm_bridge_app.py
+index 49ea3f8..022cb16 100644
+--- a/mac_app/kvm_bridge_app.py
++++ b/mac_app/kvm_bridge_app.py
+@@ -5774,6 +5774,7 @@ def main(argv=None):
+     install(cfg.language)
+     book, identity = bridge.links_from_store(settings_store, VERSION)
+     controller = WakingController(cfg, logger=logger, book=book, identity=identity, hardware=hardware_mac.hardware_address_towards)
++    controller.enable_file_drag_source()
+     app = TrayApp(controller, settings_store, logger, hidden=args.hidden)
+     instance_server = InstanceSignalServer(
+         instance_socket_path(), lambda: AppHelper.callAfter(app.open_window, None)
+diff --git a/mac_app/tests/test_file_drag_bridge.py b/mac_app/tests/test_file_drag_bridge.py
+new file mode 100644
+index 0000000..6b33c2b
+--- /dev/null
++++ b/mac_app/tests/test_file_drag_bridge.py
+@@ -0,0 +1,117 @@
++import threading
++import unittest
++from collections import deque
++from types import SimpleNamespace
++from unittest import mock
++
++import file_drag_mac
++import crossing
++from bridge_fakes import FakeClock, FakeQuartz
++from fake_link import bring_up
++from core.owner import Send
++from test_bridge import make_controller
++
++
++class DetectorTests(unittest.TestCase):
++    def test_stale_pasteboard_read_is_discarded_after_release(self):
++        began, continue_read = threading.Event(), threading.Event()
++        def read():
++            began.set()
++            continue_read.wait(2)
++            return ["/tmp/old"]
++        detector = file_drag_mac.DragDetector(read)
++        self.assertEqual(detector.update(True), ())
++        self.assertTrue(began.wait(1))
++        detector.update(False)
++        continue_read.set()
++        self.assertEqual(detector.update(False), ())
++        self.assertEqual(detector._paths, ())
++
++
++class BridgeFileDragTests(unittest.TestCase):
++    def test_file_drag_crossing_calls_handler_without_switching_input(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        peer = "peer"
++        step = SimpleNamespace(crossed=True)
++        engine = mock.Mock(armed=True, peers=[peer])
++        engine.feed.return_value = step
++        controller.crossing = engine
++        controller._crossing_ready = lambda _: True
++        controller._link_of = lambda _: SimpleNamespace(caps={"file_transfer"})
++        controller._peers_up[peer] = SimpleNamespace(caps={"file_transfer"})
++        controller._zone_peer = lambda _: peer
++        controller._current_displays = lambda: []
++        controller._file_drag_detector = SimpleNamespace(update=lambda _: ("/tmp/test",))
++        controller.on_file_drag = mock.Mock()
++        event = {"location": (1919, 100), FakeQuartz.kCGMouseEventDeltaX: 20}
++        self.assertIs(controller._handle_local_mouse(FakeQuartz.kCGEventLeftMouseDragged, event), event)
++        controller.on_file_drag.assert_called_once_with(("/tmp/test",), step, peer)
++        self.assertFalse(controller.redirecting)
++        self.assertFalse(engine.feed.call_args.kwargs["dragging"])
++        self.assertTrue(engine.feed.call_args.kwargs["ready"](peer))
++
++    def test_file_drag_does_not_choose_an_older_peer(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        peer = "peer"
++        engine = mock.Mock(armed=True, peers=[peer])
++        engine.feed.return_value = crossing.Step()
++        controller.crossing = engine
++        controller._crossing_ready = lambda _: True
++        controller._link_of = lambda _: SimpleNamespace(caps=set())
++        controller._peers_up["other"] = SimpleNamespace(caps={"file_transfer"})
++        controller._current_displays = lambda: []
++        controller._file_drag_detector = SimpleNamespace(update=lambda _: ("/tmp/test",))
++        controller.on_file_drag = mock.Mock()
++        event = {"location": (1919, 100), FakeQuartz.kCGMouseEventDeltaX: 20}
++        controller._handle_local_mouse(FakeQuartz.kCGEventLeftMouseDragged, event)
++        self.assertFalse(engine.feed.call_args.kwargs["ready"](peer))
++        controller.on_file_drag.assert_not_called()
++
++    def test_crossing_is_scheduled_on_input_runloop_and_hands_over_button(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        controller.tap_run_loop = object()
++        controller._home_presses.add(("button", "left"))
++        quartz = mock.Mock(wraps=FakeQuartz)
++        quartz.kCFRunLoopCommonModes = "common"
++        quartz.CFRunLoopPerformBlock = mock.Mock(side_effect=lambda loop, mode, callback: callback())
++        quartz.CFRunLoopWakeUp = mock.Mock()
++        controller.quartz = quartz
++        controller.set_redirecting = mock.Mock(return_value=True)
++        sent = []
++        controller._step = lambda action: action(SimpleNamespace(input=lambda message: sent.append(message)))
++        step = crossing.Step(edge="left", offset=0.5)
++        with mock.patch("bridge.input_injector_mac.inject_key") as key:
++            self.assertTrue(controller._cross_file_drag("peer", step))
++        self.assertEqual(key.call_count, 2)
++        self.assertEqual(sent, [{"type": "mousedown", "data": {"button": "left"}}])
++        self.assertNotIn(("button", "left"), controller._home_presses)
++
++    def test_released_button_cannot_start_a_drag_handoff(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        controller.tap_run_loop = object()
++        quartz = mock.Mock(wraps=FakeQuartz)
++        quartz.kCFRunLoopCommonModes = "common"
++        quartz.CFRunLoopPerformBlock = mock.Mock(side_effect=lambda loop, mode, callback: callback())
++        quartz.CFRunLoopWakeUp = mock.Mock()
++        controller.quartz = quartz
++        with mock.patch("bridge.input_injector_mac.inject_key") as key:
++            self.assertFalse(controller._cross_file_drag("peer", crossing.Step(edge="left", offset=0.5)))
++        key.assert_not_called()
++
++    def test_start_drag_message_waits_behind_clipboard_and_focus(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        link = bring_up(controller)
++        peer = link.peer_id
++        queued = deque()
++        controller._clip_wait[peer] = queued
++        message = {"type": "drag_start", "data": {"id": "a" * 32}}
++        self.assertTrue(controller._file_drag_post(link, peer)(message))
++        self.assertEqual(len(queued), 1)
++        self.assertIsInstance(queued[0], Send)
++        self.assertEqual(queued[0].message, message)
++        self.assertNotIn(message, link._posted)
+diff --git a/mac_app/tests/test_file_drag_mac.py b/mac_app/tests/test_file_drag_mac.py
+new file mode 100644
+index 0000000..c9570c5
+--- /dev/null
++++ b/mac_app/tests/test_file_drag_mac.py
+@@ -0,0 +1,55 @@
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++import file_drag_mac
++
++
++class DragPasteboardTests(unittest.TestCase):
++    def test_reads_only_the_drag_pasteboard_and_regular_local_files(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "файл.txt"
++            path.write_text("test")
++            url = SimpleNamespace(isFileURL=lambda: True, path=lambda: str(path))
++            board = mock.Mock()
++            board.readObjectsForClasses_options_.return_value = [url]
++            app = SimpleNamespace(NSPasteboard=mock.Mock(), NSPasteboardNameDrag="drag",
++                                  NSPasteboardURLReadingFileURLsOnlyKey="local")
++            app.NSPasteboard.pasteboardWithName_.return_value = board
++            with mock.patch.object(file_drag_mac, "AppKit", app), mock.patch.object(file_drag_mac, "NSURL", object):
++                self.assertEqual(file_drag_mac.dragged_file_paths(), [str(path)])
++                app.NSPasteboard.pasteboardWithName_.assert_called_once_with("drag")
++
++    def test_rejects_a_folder_and_an_unsupported_url(self):
++        with tempfile.TemporaryDirectory() as directory:
++            board = mock.Mock()
++            app = SimpleNamespace(NSPasteboard=mock.Mock(), NSPasteboardNameDrag="drag",
++                                  NSPasteboardURLReadingFileURLsOnlyKey="local")
++            app.NSPasteboard.pasteboardWithName_.return_value = board
++            with mock.patch.object(file_drag_mac, "AppKit", app), mock.patch.object(file_drag_mac, "NSURL", object):
++                for url in (SimpleNamespace(isFileURL=lambda: True, path=lambda: directory),
++                            SimpleNamespace(isFileURL=lambda: False)):
++                    board.readObjectsForClasses_options_.return_value = [url]
++                    self.assertEqual(file_drag_mac.dragged_file_paths(), [])
++
++    def test_prepares_file_items_for_native_drag(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "файл.txt"
++            path.write_text("test")
++            view, event, source, item = mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock()
++            view.convertPoint_fromView_.return_value = SimpleNamespace(x=50, y=60)
++            item_factory = mock.Mock()
++            item_factory.alloc.return_value.initWithPasteboardWriter_.return_value = item
++            workspace = mock.Mock()
++            app = SimpleNamespace(NSDraggingItem=item_factory, NSWorkspace=mock.Mock(),
++                                  NSMakeRect=lambda x, y, w, h: (x, y, w, h))
++            app.NSWorkspace.sharedWorkspace.return_value = workspace
++            url = mock.Mock()
++            with mock.patch.object(file_drag_mac, "AppKit", app), mock.patch.object(file_drag_mac, "NSURL", url):
++                session = file_drag_mac.start_drag(view, event, source, [path])
++                self.assertIs(session, view.beginDraggingSessionWithItems_event_source_.return_value)
++                url.fileURLWithPath_.assert_called_once_with(str(path))
++                view.beginDraggingSessionWithItems_event_source_.assert_called_once_with([item], event, source)
++                item.setDraggingFrame_contents_.assert_called_once()
+diff --git a/mac_app/windows_input.py b/mac_app/windows_input.py
+index 5b3d931..03ba298 100644
+--- a/mac_app/windows_input.py
++++ b/mac_app/windows_input.py
+@@ -72,6 +72,10 @@ class WindowsInput:
+             settings_callback=self._on_settings,
+             paired_callback=self._on_paired,
+             identify_callback=controller.receive_identify_screens,
++            file_callback=(controller._file_drag_links.receive
++                           if getattr(controller, "_file_drag_links", None) is not None else None),
++            file_disconnected_callback=(controller._file_drag_links.disconnect
++                                        if getattr(controller, "_file_drag_links", None) is not None else None),
+             link_callback=self._on_link,
+             announce=self._announce,
+         )
+diff --git a/win_app/file_drag_win.py b/win_app/file_drag_win.py
+new file mode 100644
+index 0000000..7bf308e
+--- /dev/null
++++ b/win_app/file_drag_win.py
+@@ -0,0 +1,120 @@
++"""Windows Qt building blocks for a native file drag.
++
++The application must arrange an OLE drop target at the crossing and initiate
++the peer drag on its GUI thread. These helpers do not change crossing behavior.
++"""
++
++import os
++import sys
++
++from PySide6.QtCore import QMimeData, QObject, Qt, QUrl, Signal, Slot
++from PySide6.QtGui import QColor, QDrag, QPainter
++from PySide6.QtWidgets import QWidget
++
++
++def local_files(mime):
++    """Local regular files offered by a Windows drag; reject unsupported items."""
++    if not mime.hasUrls():
++        return []
++    paths = []
++    for url in mime.urls():
++        if not url.isLocalFile():
++            return []
++        path = url.toLocalFile()
++        if not os.path.isabs(path) or not os.path.isfile(path) or os.path.islink(path):
++            return []
++        paths.append(path)
++    return paths
++
++
++def start_drag(widget, paths):
++    """Start a copy-only native drag from a Qt widget on the GUI thread.
++
++    The files must remain present until this function returns. The caller must
++    ensure the user is still holding the mouse button and handle cancellation.
++    """
++    if not paths or not all(os.path.isabs(path) and os.path.isfile(path) for path in paths):
++        raise ValueError("drag requires local files")
++    mime = QMimeData()
++    mime.setUrls([QUrl.fromLocalFile(os.fspath(path)) for path in paths])
++    drag = QDrag(widget)
++    drag.setMimeData(mime)
++    return drag.exec(Qt.DropAction.CopyAction)
++
++
++def button_down():
++    if sys.platform != "win32":
++        return True
++    import ctypes
++    return bool(ctypes.windll.user32.GetAsyncKeyState(1) & 0x8000)
++
++
++class DragProbe(QWidget):
++    """A short-lived OLE target the app may place at a crossing on Windows.
++
++    Emits filenames observed on entry without accepting or completing the
++    user's original drag. The app owns positioning, hiding and the decision
++    whether a particular edge movement is eligible for file transfer.
++    """
++
++    files_offered = Signal(object)
++
++    def __init__(self):
++        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint |
++                         Qt.WindowType.WindowStaysOnTopHint)
++        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
++        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
++        self.setAcceptDrops(True)
++
++    def dragEnterEvent(self, event):
++        paths = local_files(event.mimeData())
++        event.ignore()
++        if paths:
++            self.files_offered.emit(paths)
++
++    def paintEvent(self, event):
++        # A fully transparent layered window can be skipped by Windows hit
++        # testing. One nearly transparent pixel region still receives OLE.
++        painter = QPainter(self)
++        painter.fillRect(self.rect(), QColor(0, 0, 0, 2))
++        painter.end()
++
++    def dropEvent(self, event):
++        # This window only observes the source; never consume the drop here.
++        event.ignore()
++
++
++class NativeDragHost(QObject):
++    """Marshal an incoming file drag onto Qt's GUI thread.
++
++    The caller supplies staged files and must call this only after arranging
++    for the mouse button to be held on Windows. A cancelled drag releases its
++    staged files. A successful drop retains them: a target can copy the files
++    asynchronously after QDrag.exec returns.
++    """
++
++    _requested = Signal(object, object)
++    files_retained = Signal(object, object)
++
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self._source = QWidget(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
++        self._requested.connect(self._start, Qt.ConnectionType.QueuedConnection)
++
++    def begin(self, paths, release):
++        self._requested.emit(tuple(paths), release)
++
++    @Slot(object, object)
++    def _start(self, paths, release):
++        if not button_down():
++            release()
++            return
++        try:
++            action = start_drag(self._source, paths)
++        except Exception:
++            release()
++            raise
++        if action == Qt.DropAction.IgnoreAction:
++            release()
++        else:
++            self.files_retained.emit(paths, release)
+diff --git a/win_app/kvm_bridge_win.py b/win_app/kvm_bridge_win.py
+index abb6c37..b8b3124 100644
+--- a/win_app/kvm_bridge_win.py
++++ b/win_app/kvm_bridge_win.py
+@@ -64,6 +64,8 @@ from app_config import (
+     save_config,
+ )
+ from core import crash_log
++from core import drag_handoff
++from core import drag_coordinator
+ from core import portable_runtime
+ from core.portable_store import PortableStore, PortableStoreError
+ from core.capture_types import DeadKey, TextInput
+@@ -344,6 +346,8 @@ class StatusBridge(QObject):
+     update = Signal(object)
+     update_check = Signal(str, object)
+     permission = Signal(str, str, str, bool)
++    file_drag_edge = Signal(object, object, object, object, object, object)
++    file_drag_local_edge = Signal(object, object, object, object, object)
+ 
+ 
+ def _instance_server_name() -> str:
+@@ -621,6 +625,23 @@ class WindowsApplication(QWidget):
+             lambda settings: app_config.write_settings(self.config_path, settings),
+             app_config.SETTINGS_LOCK,
+         )
++        self._file_drag_host = None
++        self._file_drag_links = None
++        self._file_drag_probe = None
++        self._file_drag_coordinator = None
++        self._file_drag_context = None
++        self._file_drag_outbound_links = {}
++        if sys.platform == "win32":
++            from file_drag_win import DragProbe, NativeDragHost
++            self._file_drag_host = NativeDragHost(self)
++            self._file_drag_links = drag_handoff.DragLinks(self._file_drag_host.begin, allow_incoming=lambda: True)
++            self._file_drag_probe = DragProbe()
++            self._file_drag_probe.files_offered.connect(self._file_drag_captured)
++            self.bridge.file_drag_edge.connect(self._show_file_drag_probe)
++            self.bridge.file_drag_local_edge.connect(self._show_local_file_drag_probe)
++            self._file_drag_probe_timer = QTimer(self)
++            self._file_drag_probe_timer.setSingleShot(True)
++            self._file_drag_probe_timer.timeout.connect(self._hide_file_drag_probe)
+         self.server = LinkResponder(
+             self.book,
+             self._identity,
+@@ -636,6 +657,10 @@ class WindowsApplication(QWidget):
+             ),
+             settings_callback=lambda peer, data: self.bridge.settings.emit(protocol.id_text(peer), data),
+             identify_callback=self._receive_identify_screens,
++            file_callback=self._file_drag_links.receive if self._file_drag_links else None,
++            file_disconnected_callback=self._file_drag_links.disconnect if self._file_drag_links else None,
++            file_drag_edge_callback=self.bridge.file_drag_edge.emit if self._file_drag_links else None,
++            file_drag_release_callback=self._file_drag_release if self._file_drag_links else None,
+             paired_callback=self._store_paired,
+             link_callback=lambda peer, up: self.bridge.peers_changed.emit(),
+             announce=self._announce,
+@@ -672,6 +697,10 @@ class WindowsApplication(QWidget):
+         app.screenRemoved.connect(self._displays_changed)
+         self._refresh_own_displays()
+         self.sender.driven = lambda: self.server.driven
++        if self._file_drag_links is not None:
++            self.sender.file_transfer_callback = self._receive_outbound_file_drag
++            self.sender.file_drag_edge_callback = self.bridge.file_drag_local_edge.emit
++            self.sender.file_drag_release_callback = self._file_drag_local_release
+         self.resistance_pressure_timer = QTimer(self)
+         self.resistance_pressure_timer.setInterval(33)
+         self.resistance_pressure_timer.timeout.connect(self._refresh_local_pressure)
+@@ -684,7 +713,7 @@ class WindowsApplication(QWidget):
+             protocol.id_text(peer), read["edge"], read["set_at"], protocol.id_text(read["by"]), read.get("way_back"),
+             protocol.id_text(read["way_back_by"]) if read.get("way_back_by") else None
+         )
+-        self.sender.link_callback = lambda peer, up: self.bridge.peers_changed.emit()
++        self.sender.link_callback = self._file_drag_link_changed
+         self.sender.paired_callback = self._store_paired
+         self.sender.hw_learned = self._learn_peer_hardware
+         self.sender.announce = self._announce
+@@ -1944,6 +1973,106 @@ class WindowsApplication(QWidget):
+                                             self._peer_caps().get(peer, ())))
+         return messages
+ 
++    def _show_file_drag_probe(self, link, peer, edge, offset, display, side):
++        if self._file_drag_probe is None or not self.server.file_drag_held(link):
++            return
++        self._show_file_drag_context(("remote", link, peer, edge, offset, display, side))
++
++    def _show_local_file_drag_probe(self, peer, edge, offset, display, side):
++        if self._file_drag_probe is None or "left" not in self.sender._buttons_held:
++            return
++        link = self.sender.links._link(peer)
++        if link is not None and link.live():
++            self._show_file_drag_context(("local", link, peer, edge, offset, display, side))
++
++    def _show_file_drag_context(self, context):
++        coordinator = self._file_drag_coordinator
++        if coordinator is not None and coordinator._running:
++            return
++        self._file_drag_context = context
++        point = QCursor.pos()
++        self._file_drag_probe.setGeometry(point.x() - 12, point.y() - 12, 24, 24)
++        self._file_drag_probe.show()
++        self._file_drag_probe.raise_()
++        self._file_drag_probe_timer.start(1500)
++        QTimer.singleShot(30, self._nudge_file_drag_probe)
++
++    def _nudge_file_drag_probe(self):
++        context = self._file_drag_context
++        if context is None or self._file_drag_probe is None or not self._file_drag_probe.isVisible():
++            return
++        kind, link, peer, edge, _offset, _display, _side = context
++        held = (self.server.file_drag_held(link) if kind == "remote"
++                else "left" in self.sender._buttons_held and self.sender.links.up(peer))
++        if not held:
++            return
++        # The pointer can be pinned at the edge, so OLE may not notice a new
++        # drop target until it sees another movement. Move one pixel inward.
++        dx, dy = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}.get(edge, (0, 0))
++        if dx or dy:
++            platform_parts.injector.inject_mouse_move(dx, dy)
++
++    def _hide_file_drag_probe(self):
++        if self._file_drag_probe is not None:
++            self._file_drag_probe.hide()
++        self._file_drag_context = None
++
++    def _file_drag_captured(self, paths):
++        context = self._file_drag_context
++        self._hide_file_drag_probe()
++        if context is None:
++            return
++        kind, link, peer, edge, offset, display, side = context
++        if kind == "local":
++            held = lambda: "left" in self.sender._buttons_held and self.sender.links.up(peer)
++            post = lambda message: self.sender.post_file_ordered(peer, message)
++            cross = lambda _: self.sender.file_drag_cross(peer, edge, offset, display, side)
++            self._file_drag_outbound_links[peer] = link
++        else:
++            held = lambda: self.server.file_drag_held(link)
++            post = link.post
++            cross = lambda _: self.server.file_drag_cross(link, peer, edge, offset, display, side)
++        if not held():
++            return
++        old = self._file_drag_coordinator
++        if old is not None:
++            old.close()
++        session = self._file_drag_links.session(link, post=post)
++        def cancel_source():
++            platform_parts.injector.inject_key("esc", True)
++            platform_parts.injector.inject_key("esc", False)
++        coordinator = drag_coordinator.DragCoordinator(
++            session, held, cancel_source, cross)
++        coordinator._link = link
++        coordinator._kind = kind
++        self._file_drag_coordinator = coordinator
++        coordinator.begin(paths, context)
++
++    def _file_drag_release(self, link):
++        coordinator = self._file_drag_coordinator
++        if coordinator is not None and getattr(coordinator, "_link", None) is link:
++            coordinator.button_released()
++
++    def _file_drag_local_release(self):
++        coordinator = self._file_drag_coordinator
++        if coordinator is not None and getattr(coordinator, "_kind", None) == "local":
++            coordinator.button_released()
++
++    def _receive_outbound_file_drag(self, peer, message):
++        link = self.sender.links._link(peer)
++        if link is None or self._file_drag_links is None:
++            return
++        self._file_drag_outbound_links[peer] = link
++        self._file_drag_links.session(link, post=lambda record: self.sender.post_file_ordered(peer, record))
++        self._file_drag_links.receive(link, message)
++
++    def _file_drag_link_changed(self, peer, up):
++        if not up and self._file_drag_links is not None:
++            link = self._file_drag_outbound_links.pop(peer, None)
++            if link is not None:
++                self._file_drag_links.disconnect(link)
++        self.bridge.peers_changed.emit()
++
+     def _driver_platform(self) -> str:
+         """The platform of the machine driving this PC now, or "" when none is. From the peers the
+         window last read, not settings.json: this runs on the responder's thread as input lands."""
+@@ -1963,8 +2092,8 @@ class WindowsApplication(QWidget):
+             "platform": OWN_PLATFORM,
+             "app": VERSION[:32] if VERSION.isascii() and VERSION.isprintable() else "dev",
+             # A swipe has no shortcut every Linux desktop shares, so Linux does not offer gestures.
+-            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language")
+-                     if not (cap in ("gestures", "input_language") and OWN_PLATFORM == "linux")],
++            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language", "file_transfer")
++                     if not (cap in ("gestures", "input_language", "file_transfer") and OWN_PLATFORM == "linux")],
+             "port": self._settings_port,
+         }
+ 
+@@ -5171,6 +5300,12 @@ class WindowsApplication(QWidget):
+         # refresh rather than letting its hooks and this copy's hooks keep running together.
+         self._input_controller_blocked = True
+         self.server.stop()
++        if getattr(self, "_file_drag_probe", None) is not None:
++            self._file_drag_probe.hide()
++        if getattr(self, "_file_drag_coordinator", None) is not None:
++            self._file_drag_coordinator.close()
++        if getattr(self, "_file_drag_links", None) is not None:
++            self._file_drag_links.close()
+         self._stop_sending()
+         release, self._input_controller_release = self._input_controller_release, None
+         release()
+@@ -5466,6 +5601,12 @@ class WindowsApplication(QWidget):
+             self.pairing.cancel_nearby()
+             self.pairing.stop()
+         self.server.stop()
++        if getattr(self, "_file_drag_probe", None) is not None:
++            self._file_drag_probe.hide()
++        if getattr(self, "_file_drag_coordinator", None) is not None:
++            self._file_drag_coordinator.close()
++        if getattr(self, "_file_drag_links", None) is not None:
++            self._file_drag_links.close()
+         self._stop_sending()
+         shortcut = getattr(self, "global_shortcut", None)
+         if shortcut is not None:
+diff --git a/win_app/sender.py b/win_app/sender.py
+index de19d8a..57bfb9b 100644
+--- a/win_app/sender.py
++++ b/win_app/sender.py
+@@ -28,6 +28,8 @@ import time
+ from typing import Callable, Optional
+ 
+ from core import keyboard_sync
++from core import file_transfer
++from core import drag_handoff
+ import keyboard_language
+ from core import ignored
+ from core import keytable
+@@ -250,6 +252,10 @@ class LinkSender:
+         self.arrangement_callback: Optional[Callable] = None
+         self.settings_callback: Optional[Callable] = None
+         self.identify_callback: Optional[Callable] = None
++        self.file_transfer_callback: Optional[Callable] = None
++        self.file_drag_edge_callback: Optional[Callable] = None
++        self.file_drag_release_callback: Optional[Callable] = None
++        self._file_drag_probe_at = float("-inf")
+         self.paired_callback: Optional[Callable] = None
+         self.link_callback: Optional[Callable[[bytes, bool], None]] = None
+ 
+@@ -699,6 +705,8 @@ class LinkSender:
+             self._buttons_held.add(name)
+         else:
+             self._buttons_held.discard(name)
++            if name == "left" and self.file_drag_release_callback is not None:
++                self._call(self.file_drag_release_callback)
+         if self._shake_detector is not None:
+             self._shake_detector.held(self._clock(), bool(self._buttons_held or self._keys_down))
+         owner = self._owner
+@@ -828,7 +836,9 @@ class LinkSender:
+         if ((self._home_hold is not None and self._home_hold.blocks(self._clock()))
+                 or not self._models or self.edges_held or self._owner is None):
+             return
+-        if self._buttons_held and self._setting("block_while_dragging", True) and self._still_dragging():
++        file_dragging = ("left" in self._buttons_held and self.file_drag_edge_callback is not None
++                         and any("file_transfer" in self.links.caps(peer) for peer, _ in self._models))
++        if self._buttons_held and self._setting("block_while_dragging", True) and self._still_dragging() and not file_dragging:
+             # A drag that reaches the edge is dragging, not leaving: the push so far is dropped,
+             # as the Mac drops it, so letting go at the edge does not finish a crossing.
+             for _peer, model in self._models:
+@@ -848,6 +858,8 @@ class LinkSender:
+             outcome = model = target = None
+             display_map = self._cached_display_map()
+             for peer, candidate in list(self._models):
++                if file_dragging and "file_transfer" not in self.links.caps(peer):
++                    continue
+                 result = candidate.feed(monitors, pointer, float(dx), float(dy), display_map=display_map)
+                 if result.action != return_edge.PASS:
+                     outcome, model, target = result, candidate, peer
+@@ -868,6 +880,13 @@ class LinkSender:
+         self._notify_pressure(model.edge, outcome.pressure, outcome.action == return_edge.CROSS, part)
+         if outcome.action == return_edge.CROSS:
+             offset = receiver.corner_offset(model.corner, model.edge) if isinstance(model, return_edge.CornerPush) else outcome.offset
++            if file_dragging:
++                model.reset()
++                now = self._clock()
++                if now - self._file_drag_probe_at >= 0.25:
++                    self._file_drag_probe_at = now
++                    self._call(self.file_drag_edge_callback, target, outcome.edge, offset, outcome.display, outcome.side)
++                return
+             # The model names the edge on the far side, not the one just left: it is the same
+             # border, read from the other end. The display it leads to lands the pointer there, as
+             # the Mac's own crossing does.
+@@ -943,6 +962,31 @@ class LinkSender:
+            display=None, side=None) -> bool:
+         return self._go(peer, edge, offset, display, side)
+ 
++    def file_drag_cross(self, peer, edge, offset, display=None, side=None):
++        """Cross after staging files and transfer the locally held mouse button."""
++        if "left" not in self._buttons_held or self.driven() or not self._go(peer, edge, offset, display, side):
++            return False
++        with self._lock:
++            if "left" not in self._buttons_held or self._owner.on != peer:
++                return False
++            actions = self._owner.adopt_local_button("left")
++            if not actions:
++                return False
++            self._queue(actions)
++        self._report(actions)
++        return True
++
++    def post_file_ordered(self, peer, message):
++        """Queue file control behind focus, clipboard and held-button input."""
++        if not self.links.up(peer) or "file_transfer" not in self.links.caps(peer):
++            return False
++        with self._lock:
++            self._queue([owner_module.Send(peer, message)])
++            accepted = not self._overflowed
++        if not accepted:
++            self._report([])
++        return accepted
++
+     def _go(self, peer: bytes, edge=None, offset=None, display=None, side=None) -> bool:
+         owner = self._owner
+         if owner is None:
+@@ -1060,6 +1104,9 @@ class LinkSender:
+                     actions = self._owner.clipboard_arrived(peer, began_at if began_at is not None else self._clock(), clean)
+                     self._queue(actions)
+                 self._report(actions)
++        elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
++            if "file_transfer" in self.links.caps(peer) and self.file_transfer_callback is not None:
++                self._call(self.file_transfer_callback, peer, message)
+         elif kind == protocol.MSG_ARRANGEMENT:
+             read = protocol.read_arrangement_v6(message, time.time())
+             if read is not None and self.arrangement_callback is not None:
+diff --git a/win_app/tests/test_file_drag_win.py b/win_app/tests/test_file_drag_win.py
+new file mode 100644
+index 0000000..007e450
+--- /dev/null
++++ b/win_app/tests/test_file_drag_win.py
+@@ -0,0 +1,74 @@
++import tempfile
++import unittest
++from pathlib import Path
++from unittest import mock
++
++from PySide6.QtCore import QMimeData, Qt, QUrl
++from PySide6.QtWidgets import QApplication
++
++import file_drag_win
++
++
++class WindowsDragTests(unittest.TestCase):
++    def test_local_file_urls_and_unsupported_items(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "файл.txt"
++            path.write_text("test")
++            mime = QMimeData()
++            mime.setUrls([QUrl.fromLocalFile(str(path))])
++            self.assertEqual(file_drag_win.local_files(mime), [str(path)])
++            mime.setUrls([QUrl.fromLocalFile(str(path)), QUrl("https://example.org/file")])
++            self.assertEqual(file_drag_win.local_files(mime), [])
++            mime.setUrls([QUrl.fromLocalFile(directory)])
++            self.assertEqual(file_drag_win.local_files(mime), [])
++
++    def test_probe_does_not_consume_the_original_drag(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "file.txt"
++            path.write_text("example")
++            mime = QMimeData()
++            mime.setUrls([QUrl.fromLocalFile(str(path))])
++            event = mock.Mock()
++            event.mimeData.return_value = mime
++            target = mock.Mock()
++            file_drag_win.DragProbe.dragEnterEvent(target, event)
++            event.ignore.assert_called_once()
++            target.files_offered.emit.assert_called_once_with([str(path)])
++
++    def test_native_host_keeps_files_after_copy_for_async_targets(self):
++        host, release = mock.Mock(), mock.Mock()
++        paths = ("file",)
++        with mock.patch.object(file_drag_win, "button_down", return_value=True), \
++             mock.patch.object(file_drag_win, "start_drag", return_value=Qt.DropAction.CopyAction):
++            file_drag_win.NativeDragHost._start(host, paths, release)
++        release.assert_not_called()
++        host.files_retained.emit.assert_called_once_with(paths, release)
++
++    def test_start_drag_accepts_staged_path_objects(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "файл.txt"
++            path.write_text("test")
++            drag = mock.Mock()
++            with mock.patch.object(file_drag_win, "QDrag", return_value=drag):
++                file_drag_win.start_drag(mock.Mock(), [path])
++            mime = drag.setMimeData.call_args.args[0]
++            self.assertEqual(mime.urls()[0].toLocalFile(), str(path))
++
++    def test_native_host_cleans_up_cancelled_drag(self):
++        host, release = mock.Mock(), mock.Mock()
++        with mock.patch.object(file_drag_win, "button_down", return_value=True), \
++             mock.patch.object(file_drag_win, "start_drag", return_value=Qt.DropAction.IgnoreAction):
++            file_drag_win.NativeDragHost._start(host, ("file",), release)
++        release.assert_called_once()
++
++    def test_native_host_dispatches_to_qt_thread(self):
++        app = QApplication.instance() or QApplication([])
++        host = file_drag_win.NativeDragHost()
++        release = mock.Mock()
++        with mock.patch.object(file_drag_win, "button_down", return_value=True), \
++             mock.patch.object(file_drag_win, "start_drag", return_value=Qt.DropAction.IgnoreAction) as start:
++            host.begin(("file",), release)
++            self.assertFalse(start.called)
++            app.processEvents()
++        start.assert_called_once()
++        release.assert_called_once()
+diff --git a/win_app/tests/test_links.py b/win_app/tests/test_links.py
+index 3978539..1a1c468 100644
+--- a/win_app/tests/test_links.py
++++ b/win_app/tests/test_links.py
+@@ -145,6 +145,22 @@ class EdgeTests(unittest.TestCase):
+         self.rig.push(10)
+         self.assertFalse(self.sender.redirecting)
+ 
++    def test_a_file_drag_waits_for_staging_then_hands_over_the_button(self):
++        edges = []
++        self.rig.links.caps_of[B] = {"clipboard", "file_transfer"}
++        self.sender.file_drag_edge_callback = lambda *args: edges.append(args)
++        self.sender.on_button("left", True)
++        self.rig.push(4)
++        self.assertTrue(edges)
++        self.assertFalse(self.sender.redirecting)
++        peer, edge, offset, display, side = edges[0]
++        self.assertTrue(self.sender.file_drag_cross(peer, edge, offset, display, side))
++        self.rig.flush()
++        self.assertEqual(self.rig.sent(B, "mousedown")[-1]["data"]["button"], "left")
++        self.sender.on_button("left", False)
++        self.rig.flush()
++        self.assertEqual(self.rig.sent(B, "mouseup")[-1]["data"]["button"], "left")
++
+ 
+ class CornerTests(unittest.TestCase):
+     """The corner is for a machine whose whole edge is busy: it wants a diagonal push in an

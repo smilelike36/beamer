@@ -1,7 +1,7 @@
-name: Build file drag Windows preview
+name: Build file shelf Windows preview
 on:
   push:
-    branches: [build/file-drag-20261027]
+    branches: [build/file-shelf-ru6-20261027]
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,26 +14,26 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v7
-      - name: Apply verified file drag changes
+      - name: Apply verified changes
         run: |
           $patch = "$PWD/beamer-file-drag.patch"
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne '427742da8a9dc6f2cea2be15e3b76544837ec12639500ac691347eae6e52b6d9') { throw 'Patch checksum mismatch' }
-          git apply --check $patch
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne '702359ff7385e96e28531beded52ab5e2e174f818c3799e0eb3946c0124da093') { throw 'Patch checksum mismatch' }
+          git apply --exclude=.github/workflows/windows-ru-preview.yml --check $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git apply $patch
+          git apply --exclude=.github/workflows/windows-ru-preview.yml $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.5-shelf-preview`n", [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.6-shelf-preview", [Text.UTF8Encoding]::new($false))
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           architecture: x64
           cache: pip
           cache-dependency-path: win_app/requirements-win.txt
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           python -m pip install -r win_app/requirements-win.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check file transfer and shared input
+      - name: Test file transfer and shared input
         env:
           PYTHONPATH: .;win_app;win_app/tests
           QT_QPA_PLATFORM: offscreen
@@ -42,7 +42,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest core.tests.test_keyboard_sync core.tests.test_protocol_v6 core.tests.test_owner core.tests.test_drag_coordinator core.tests.test_drag_handoff core.tests.test_file_drag_receiver core.tests.test_file_transfer core.tests.test_file_transfer_link core.tests.test_file_shelf
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check Windows drag and input handling
+      - name: Test Windows drag and input
         working-directory: win_app
         env:
           PYTHONPATH: ..;tests;../core/tests
@@ -50,7 +50,7 @@ jobs:
         run: |
           python -m unittest test_keyboard_language test_input_injector test_links test_app_config test_i18n_pages test_file_drag_win test_file_shelf_win
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Freeze standalone Windows application
+      - name: Freeze Windows application
         run: |
           python -m PyInstaller --clean --noconfirm --distpath win_app/dist --workpath build-windows win_app/build.spec
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -60,7 +60,7 @@ jobs:
         run: |
           choco install innosetup --no-progress --yes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $iscc = (Get-ChildItem "${env:ProgramFiles(x86)}/Inno Setup*/ISCC.exe" | Select-Object -First 1).FullName
+          $iscc = (Get-ChildItem "C:/Program Files (x86)/Inno Setup*/ISCC.exe" | Select-Object -First 1).FullName
           if (-not $iscc) { throw 'Inno Setup not found' }
           & $iscc /DCommunityPreview /O"$PWD/installer-output" win_app/Beamer-Setup.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -68,7 +68,7 @@ jobs:
           git rev-parse HEAD | Set-Content installer-output/COMMIT.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: Beamer-File-Shelf-Windows-ru5
+          name: Beamer-File-Shelf-Windows-ru6
           path: |
             installer-output/*.exe
             installer-output/SHA256SUMS.txt

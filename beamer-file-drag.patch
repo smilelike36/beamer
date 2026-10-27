@@ -392,12 +392,221 @@ index 0000000..2585323
 +            self._sessions.clear()
 +        for _session, dispatcher in items:
 +            dispatcher.close()
+diff --git a/core/file_shelf.py b/core/file_shelf.py
+new file mode 100644
+index 0000000..2e19be7
+--- /dev/null
++++ b/core/file_shelf.py
+@@ -0,0 +1,203 @@
++"""A local file shelf and a separate, authenticated peer transfer session.
++
++Transport adapters must only deliver messages received over an authenticated
++connection that negotiated the file_shelf capability. This module does not
++provide a UI or grant access to arbitrary local files.
++"""
++
++import os
++import hashlib
++import stat
++import shutil
++import tempfile
++import threading
++from pathlib import Path
++
++from . import file_transfer
++
++SHELF_MESSAGE = "file_shelf"
++
++
++def unwrap(message):
++    if not isinstance(message, dict) or set(message) != {"type", "data"}:
++        return None
++    if message.get("type") != SHELF_MESSAGE or not isinstance(message.get("data"), dict):
++        return None
++    record = message["data"]
++    return record if file_transfer.read_record(record) is not None else None
++
++
++class FileShelf:
++    """Store received files in separate private directories without overwriting."""
++
++    def __init__(self, root):
++        self.root = Path(root)
++        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
++        self._lock = threading.Lock()
++        self._pending = set()
++
++    def accept(self, name, size):
++        if not file_transfer.valid_name(name) or type(size) is not int or not 0 <= size <= file_transfer.MAX_FILE_BYTES:
++            return None
++        directory = Path(tempfile.mkdtemp(prefix="incoming-", dir=self.root))
++        with self._lock:
++            self._pending.add(directory)
++        return directory
++
++    def store_copy(self, source):
++        source = Path(source)
++        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
++        with os.fdopen(os.open(source, flags), "rb") as stream:
++            info = os.fstat(stream.fileno())
++            if not stat.S_ISREG(info.st_mode) or info.st_size > file_transfer.MAX_FILE_BYTES:
++                raise ValueError("unsupported file")
++            directory = self.accept(source.name, info.st_size)
++            if directory is None:
++                raise ValueError("unsupported file name")
++            incoming = file_transfer.IncomingFile(directory, source.name, info.st_size)
++            digest, offset = hashlib.sha256(), 0
++            try:
++                while offset < info.st_size:
++                    block = stream.read(min(file_transfer.MAX_CHUNK_BYTES, info.st_size - offset))
++                    if not block:
++                        raise OSError("source shortened")
++                    incoming.write(offset, block)
++                    digest.update(block)
++                    offset += len(block)
++                if stream.read(1):
++                    raise OSError("source changed size")
++                path = incoming.finish(digest.hexdigest())
++                self.complete(path)
++                return path
++            except Exception:
++                incoming.cancel()
++                self.discard_pending({directory})
++                raise
++
++    def complete(self, path):
++        path = Path(path)
++        with self._lock:
++            if path.parent not in self._pending:
++                raise ValueError("file is not a pending shelf transfer")
++            # Atomic marker publication: list_files ignores incomplete transfers.
++            marker = self.root / (".complete-" + path.parent.name)
++            marker.touch(exist_ok=False)
++            self._pending.remove(path.parent)
++
++    def list_files(self):
++        result = []
++        for directory in self.root.glob("incoming-*"):
++            if not directory.is_dir() or directory.is_symlink() or not (self.root / (".complete-" + directory.name)).is_file():
++                continue
++            result.extend(path for path in directory.iterdir()
++                          if path.is_file() and not path.is_symlink())
++        return sorted(result, key=lambda item: (item.name.casefold(), str(item)))
++
++    def discard_pending(self, directories=None):
++        with self._lock:
++            pending = self._pending if directories is None else self._pending.intersection(directories)
++            self._pending = self._pending.difference(pending)
++        for directory in pending:
++            shutil.rmtree(directory, ignore_errors=True)
++
++
++class ShelfSession:
++    """Transfer shelf files without sharing state with native drag sessions."""
++
++    def __init__(self, shelf, post, timeout=30):
++        self.shelf = shelf
++        self._directories = set()
++        def accept(name, size):
++            directory = shelf.accept(name, size)
++            if directory is not None:
++                self._directories.add(directory)
++            return directory
++        self._endpoint = file_transfer.TransferEndpoint(
++            lambda record: post({"type": SHELF_MESSAGE, "data": record}),
++            accept, shelf.complete, timeout=timeout)
++        self._dispatcher = file_transfer.TransferDispatcher(self._endpoint)
++
++    def send_file(self, path):
++        return self._endpoint.send_file(os.fspath(path))
++
++    def receive(self, message):
++        record = unwrap(message)
++        return record is not None and self._dispatcher.deliver(record)
++
++    def close(self):
++        self._dispatcher.close()
++        self._dispatcher.wait_closed(2)
++        self.shelf.discard_pending(self._directories)
++
++
++class ShelfLinks:
++    """Maintain a separate shelf session per authenticated Beamer link."""
++
++    def __init__(self, root):
++        self.shelf = FileShelf(root)
++        self._lock = threading.RLock()
++        self._sessions = {}
++        self._sending = set()
++        self._closed = False
++
++    def send_files(self, link, paths, notify):
++        paths = tuple(Path(path) for path in paths)
++        if not paths or not all(path.is_file() and not path.is_symlink() for path in paths):
++            notify("Выберите обычные файлы.")
++            return False
++        with self._lock:
++            if self._closed:
++                notify("Полка закрыта.")
++                return False
++            if link in self._sending:
++                notify("Дождитесь завершения предыдущей передачи.")
++                return False
++            self._sending.add(link)
++        def run():
++            try:
++                notify("Передача файлов…")
++                session = self.session(link)
++                for path in paths:
++                    stored = self.shelf.store_copy(path)
++                    session.send_file(stored)
++                notify("Файлы переданы.")
++            except Exception:
++                notify("Не удалось передать файлы. Проверьте соединение и повторите.")
++            finally:
++                with self._lock:
++                    self._sending.discard(link)
++        try:
++            threading.Thread(target=run, name="Beamer-shelf-send", daemon=True).start()
++        except Exception:
++            with self._lock:
++                self._sending.discard(link)
++            raise
++        return True
++
++    def session(self, link, post=None):
++        with self._lock:
++            if self._closed:
++                raise RuntimeError("shelf closed")
++            if link not in self._sessions:
++                if len(self._sessions) >= 16:
++                    raise RuntimeError("too many shelf sessions")
++                self._sessions[link] = ShelfSession(self.shelf, post or link.post)
++            return self._sessions[link]
++
++    def receive(self, link, message):
++        if unwrap(message) is None:
++            return False
++        return self.session(link).receive(message)
++
++    def disconnect(self, link):
++        with self._lock:
++            session = self._sessions.pop(link, None)
++        if session:
++            session.close()
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++            sessions, self._sessions = list(self._sessions.values()), {}
++        for session in sessions:
++            session.close()
 diff --git a/core/file_transfer.py b/core/file_transfer.py
 new file mode 100644
-index 0000000..4b5c8ad
+index 0000000..62cca5f
 --- /dev/null
 +++ b/core/file_transfer.py
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,389 @@
 +"""Bounded file-transfer primitives; not yet connected to the platform UI.
 +
 +The receiver stages bytes in the destination directory and publishes a verified
@@ -719,14 +928,12 @@ index 0000000..4b5c8ad
 +                    path = incoming.finish(record["sha256"])
 +                    offset = incoming._written
 +                    self._incoming = None
++                    self._completed(path)
 +                    self._send(self._message("file_ack", ident, stage="finish", offset=offset))
-+                    completed_path = path
 +            except Exception:
 +                incoming.cancel()
 +                self._incoming = None
 +                self._send(self._message("file_cancel", ident))
-+            if completed_path is not None:
-+                self._completed(completed_path)
 +        return True
 +
 +    def close(self):
@@ -790,31 +997,38 @@ index 0000000..4b5c8ad
 +    def wait_closed(self, timeout=None):
 +        return self._stopped.wait(timeout)
 diff --git a/core/link.py b/core/link.py
-index 34f42be..02a995d 100644
+index 34f42be..39f7a7b 100644
 --- a/core/link.py
 +++ b/core/link.py
-@@ -24,6 +24,8 @@ import time
+@@ -24,6 +24,9 @@ import time
  from core import peerlist
  from core import protocol
  from core import receiver
 +from core import file_transfer
++from core import file_shelf
 +from core import drag_handoff
  from core.i18n import tr
  from core.response_time import ResponseTime
  from core.link_timing import LinkTiming
-@@ -769,6 +771,8 @@ class OutboundLink:
+@@ -769,6 +772,10 @@ class OutboundLink:
          if not self._live:
              return False
          kind = message.get("type")
++        if kind == file_shelf.SHELF_MESSAGE and "file_shelf" not in self._caps:
++            return False
 +        if kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES and "file_transfer" not in self._caps:
 +            return False
          if kind in (protocol.MSG_FOCUS, protocol.MSG_SWITCH) and "displays" not in self._caps:
              data = dict(message.get("data") or {})
              data.pop("display", None)
-@@ -1014,6 +1018,8 @@ def _weight(message):
+@@ -1014,6 +1021,12 @@ def _weight(message):
      """About how many bytes a queued message holds: a clipboard's text and image, else nothing."""
      if message.get("type") == protocol.MSG_MOUSEMOVE:
          return len((message.get("data") or {}).get("samples", ())) * 32
++    if message.get("type") == file_shelf.SHELF_MESSAGE:
++        inner = message.get("data") or {}
++        if inner.get("type") == "file_chunk":
++            return len((inner.get("data") or {}).get("bytes") or "")
 +    if message.get("type") == "file_chunk":
 +        return len((message.get("data") or {}).get("bytes") or "")
      if message.get("type") != protocol.MSG_CLIPBOARD:
@@ -845,59 +1059,68 @@ index 4e0227b..53d9e11 100644
          kind, ident = message.get("type"), _ident(message)
          if ident in self._here:
 diff --git a/core/receiver.py b/core/receiver.py
-index 7826abc..6621edc 100644
+index 7826abc..f25ac61 100644
 --- a/core/receiver.py
 +++ b/core/receiver.py
-@@ -18,6 +18,8 @@ from typing import Callable, Optional, Tuple
+@@ -18,6 +18,9 @@ from typing import Callable, Optional, Tuple
  from . import return_edge as crossing
  from . import peerlist
  from . import protocol
 +from . import file_transfer
++from . import file_shelf
 +from . import drag_handoff
  from .i18n import tr, trc
  from .response_time import ResponseTime
  from .link_timing import LinkTiming
-@@ -541,6 +543,10 @@ class LinkResponder:
+@@ -541,6 +544,12 @@ class LinkResponder:
          arrangement_callback=None,
          settings_callback=None,
          identify_callback=None,
 +        file_callback=None,
 +        file_disconnected_callback=None,
++        shelf_callback=None,
++        shelf_disconnected_callback=None,
 +        file_drag_edge_callback=None,
 +        file_drag_release_callback=None,
          paired_callback=None,
          link_callback=None,
          announce=None,
-@@ -561,6 +567,10 @@ class LinkResponder:
+@@ -561,6 +570,12 @@ class LinkResponder:
              "owner": owner_callback, "arrival": arrival_callback, "pressure": pressure_callback,
              "arrangement": arrangement_callback, "settings": settings_callback, "paired": paired_callback,
              "identify": identify_callback,
 +            "file": file_callback,
 +            "file_disconnected": file_disconnected_callback,
++            "shelf": shelf_callback,
++            "shelf_disconnected": shelf_disconnected_callback,
 +            "file_drag_edge": file_drag_edge_callback,
 +            "file_drag_release": file_drag_release_callback,
              "link": link_callback,
          }
          self._announce = announce or (lambda peer: [])
-@@ -954,6 +964,7 @@ class LinkResponder:
+@@ -954,6 +969,8 @@ class LinkResponder:
                      link.timing.flush(ping_ms=link.response_time_ms)
          finally:
              link.close()
 +            self._callback("file_disconnected", link)
++            self._callback("shelf_disconnected", link)
              with self._lock:
                  current = self._links.get(link.peer_id) is link
                  if current:
-@@ -1053,6 +1064,9 @@ class LinkResponder:
+@@ -1053,6 +1070,12 @@ class LinkResponder:
                  self._on_focus(link, message)
              elif kind == protocol.MSG_CLIPBOARD:
                  self._on_clipboard(link, message)
++            elif kind == file_shelf.SHELF_MESSAGE:
++                if "file_shelf" in link.caps and "file_shelf" in link.own_caps:
++                    self._callback("shelf", link, message)
 +            elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
 +                if "file_transfer" in link.caps and "file_transfer" in link.own_caps:
 +                    self._callback("file", link, message)
              elif kind == protocol.MSG_ARRANGEMENT:
                  read = protocol.read_arrangement_v6(message, time.time())
                  if read is not None:
-@@ -1224,6 +1238,8 @@ class LinkResponder:
+@@ -1224,6 +1247,8 @@ class LinkResponder:
              self._inject_timed_locked(link, dict(move, dx=scaled_dx, dy=scaled_dy), scaled=True)
  
      def _apply_input_locked(self, link, read, after):
@@ -906,7 +1129,7 @@ index 7826abc..6621edc 100644
          zones_at = time.monotonic()
          consumed = read["type"] == protocol.MSG_MOUSEMOVE and self._zones_locked(link, read, after)
          link.timing.add("zones", time.monotonic() - zones_at)
-@@ -1485,6 +1501,15 @@ class LinkResponder:
+@@ -1485,6 +1510,15 @@ class LinkResponder:
                  after.append(lambda: self._callback("pressure", model.edge, outcome.pressure, False, part))
                  return True
              offset = corner_offset(model.corner, model.edge) if isinstance(model, crossing.CornerPush) else outcome.offset
@@ -922,7 +1145,7 @@ index 7826abc..6621edc 100644
              # Built before disarming: a switch that cannot be built must not leave this machine with
              # no way out until the next focus (rc12, 10-10-2026).
              try:
-@@ -1507,6 +1532,22 @@ class LinkResponder:
+@@ -1507,6 +1541,22 @@ class LinkResponder:
              return True
          return False
  
@@ -1231,6 +1454,115 @@ index 0000000..ee15c41
 +        self.link.held.clear()
 +        self.assertFalse(self.responder.file_drag_cross(self.link, self.peer, "left", 0.5))
 +        self.link.post.assert_not_called()
+diff --git a/core/tests/test_file_shelf.py b/core/tests/test_file_shelf.py
+new file mode 100644
+index 0000000..0b697ed
+--- /dev/null
++++ b/core/tests/test_file_shelf.py
+@@ -0,0 +1,103 @@
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++
++from core.file_shelf import FileShelf, ShelfSession, unwrap
++
++
++class FileShelfTests(unittest.TestCase):
++    def test_transfer_preserves_content_and_duplicate_names(self):
++        with tempfile.TemporaryDirectory() as root:
++            root = Path(root)
++            left, right = FileShelf(root / "left"), FileShelf(root / "right")
++            sessions = {}
++            a = ShelfSession(left, lambda msg: sessions["b"].receive(msg))
++            b = ShelfSession(right, lambda msg: sessions["a"].receive(msg))
++            sessions.update(a=a, b=b)
++            self.addCleanup(a.close)
++            self.addCleanup(b.close)
++            source = root / "тест.txt"
++            source.write_text("first", encoding="utf-8")
++            a.send_file(source)
++            source.write_text("second", encoding="utf-8")
++            a.send_file(source)
++            result = right.list_files()
++            self.assertEqual(len(result), 2)
++            self.assertEqual({p.read_text(encoding="utf-8") for p in result}, {"first", "second"})
++
++    def test_incomplete_file_is_not_visible_and_is_removed(self):
++        with tempfile.TemporaryDirectory() as root:
++            shelf = FileShelf(root)
++            folder = shelf.accept("part.txt", 4)
++            (folder / "part.txt").write_bytes(b"part")
++            self.assertEqual(shelf.list_files(), [])
++            shelf.discard_pending()
++            self.assertFalse(folder.exists())
++
++    def test_shelf_accepts_names_matching_internal_marker(self):
++        with tempfile.TemporaryDirectory() as root:
++            root = Path(root)
++            source = root / ".complete"
++            source.write_text("content")
++            shelf = FileShelf(root / "shelf")
++            stored = shelf.store_copy(source)
++            self.assertEqual(shelf.list_files(), [stored])
++            self.assertEqual(stored.read_text(), "content")
++
++    def test_disconnecting_one_session_does_not_remove_another_pending_file(self):
++        with tempfile.TemporaryDirectory() as root:
++            shelf = FileShelf(root)
++            a = shelf.accept("a.txt", 1)
++            b = shelf.accept("b.txt", 1)
++            shelf.discard_pending({a})
++            self.assertFalse(a.exists())
++            self.assertTrue(b.exists())
++
++    def test_rejects_malformed_and_unrelated_records(self):
++        self.assertIsNone(unwrap({"type": "file_shelf", "data": {"type": "file_offer", "data": {"name": "../x"}}}))
++        self.assertIsNone(unwrap({"type": "file_offer", "data": {}}))
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++class ShelfLinkTests(unittest.TestCase):
++    def test_shelf_files_cross_authenticated_link_in_both_directions(self):
++        from core.file_shelf import ShelfLinks
++        from core.link import OutboundLink
++        from core.tests.responder_harness import B, CAPS, Machine, entry, wait_for
++        from core.tests.test_link import Side
++        caps = list(CAPS) + ["file_shelf"]
++        machine = Machine([entry(B, "Peer")], caps=caps).start()
++        self.addCleanup(machine.stop)
++        with tempfile.TemporaryDirectory() as root:
++            source = Path(root) / "source"
++            dest = Path(root) / "dest"
++            left, right = ShelfLinks(source), ShelfLinks(dest)
++            machine.responder._callbacks["shelf"] = right.receive
++            machine.responder._callbacks["shelf_disconnected"] = right.disconnect
++            side = Side(machine)
++            identity = side.identity
++            side.identity = lambda: identity(caps=caps)
++            connection = OutboundLink(side.peer()["token"], side.book, side.identity,
++                                      message=lambda link, msg: left.receive(link, msg), reconnect_seconds=30)
++            connection.start()
++            try:
++                self.assertTrue(wait_for(connection.live, 5))
++                content = bytes(range(256)) * 512
++                file = Path(root) / "тест.bin"
++                file.write_bytes(content)
++                self.assertEqual(left.session(connection).send_file(file), len(content))
++                self.assertTrue(wait_for(lambda: len(right.shelf.list_files()) == 1, 3))
++                self.assertEqual(right.shelf.list_files()[0].read_bytes(), content)
++                remote_link = next(iter(right._sessions))
++                reverse = Path(root) / "обратно.txt"
++                reverse.write_text("reverse", encoding="utf-8")
++                self.assertEqual(right.session(remote_link).send_file(reverse), 7)
++                self.assertTrue(wait_for(lambda: len(left.shelf.list_files()) == 1, 3))
++                self.assertEqual(left.shelf.list_files()[0].read_text(encoding="utf-8"), "reverse")
++            finally:
++                connection.stop()
++                left.close()
++                right.close()
 diff --git a/core/tests/test_file_transfer.py b/core/tests/test_file_transfer.py
 new file mode 100644
 index 0000000..5635030
@@ -1630,10 +1962,18 @@ index 0000000..75c070f
 +The native Finder and Windows Explorer integration must be tested on actual
 +macOS and Windows desktops before this preview is treated as a release.
 diff --git a/mac_app/bridge.py b/mac_app/bridge.py
-index 5c6c5b5..7bb8448 100644
+index 5c6c5b5..0582d83 100644
 --- a/mac_app/bridge.py
 +++ b/mac_app/bridge.py
-@@ -34,8 +34,13 @@ from core import identify_screens
+@@ -13,6 +13,7 @@ import traceback
+ import types
+ import dataclasses
+ from dataclasses import dataclass
++from pathlib import Path
+ 
+ import objc
+ import Quartz
+@@ -34,8 +35,14 @@ from core import identify_screens
  import frame_clock
  import keyboard_layout
  import fn_language
@@ -1642,21 +1982,22 @@ index 5c6c5b5..7bb8448 100644
  import media_keys
  from core import keyboard_sync
 +from core import file_transfer
++from core import file_shelf
 +from core import drag_handoff
 +from core import drag_coordinator
  from core import keytable
  from core import link as link_module
  from core import owner as owner_module
-@@ -82,7 +87,7 @@ ROUND_TRIP_MAX_AGE_SECONDS = 5.0
+@@ -82,7 +89,7 @@ ROUND_TRIP_MAX_AGE_SECONDS = 5.0
  # the ownership by force after one second), then goes ahead.
  LET_GO_WAIT_SECONDS = 1.3
  OWN_PLATFORM = "macos"
 -CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language")
-+CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language", "file_transfer")
++CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "ping_rtt", "identify_screens", "motion_path", "input_language", "file_shelf")
  MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"})
  
  # Why input came home, in words, for the alert. A why that is not here comes home quietly.
-@@ -621,6 +626,14 @@ class KVMController:
+@@ -621,6 +628,17 @@ class KVMController:
          self.on_arrangement = None
          self.on_settings = None
          self.on_paired = None
@@ -1667,11 +2008,14 @@ index 5c6c5b5..7bb8448 100644
 +        # The source-side handler is installed only after the platform service
 +        # is explicitly enabled; the existing input behavior stays unchanged.
 +        self._file_drag_links = None
++        self._file_shelf_links = None
++        self.on_shelf_drag = None
++        self._shelf_shown_for_press = False
 +        self._file_drag_coordinator = None
          # What to send a peer the moment its link is up: the app's own messages, of which only the
          # settings state goes on to a peer that keeps it (the arrangement and `paired` are made here).
          self.announce = lambda: []
-@@ -1250,6 +1263,10 @@ class KVMController:
+@@ -1250,6 +1268,12 @@ class KVMController:
  
      def stop(self):
          self.idle_pointer.cancel()
@@ -1679,14 +2023,17 @@ index 5c6c5b5..7bb8448 100644
 +            self._file_drag_coordinator.close()
 +        if getattr(self, "_file_drag_links", None) is not None:
 +            self._file_drag_links.close()
++        if getattr(self, "_file_shelf_links", None) is not None:
++            self._file_shelf_links.close()
          self._return_local()
          # The let-go and what is ahead of it may be waiting behind a clipboard read: sent first.
          deadline = time.monotonic() + 1.0
-@@ -1846,6 +1863,17 @@ class KVMController:
+@@ -1846,6 +1870,18 @@ class KVMController:
                      self._repair_redirecting_disagreement()
                      return event
                  button = self.translator.button_of(event_type, event)
 +                if button == ("left", True) and not self.redirecting:
++                    self._shelf_shown_for_press = False
 +                    detector = getattr(self, "_file_drag_detector", None)
 +                    if detector is not None:
 +                        detector.arm()
@@ -1700,7 +2047,7 @@ index 5c6c5b5..7bb8448 100644
                  if not self.redirecting:
                      if button is not None:
                          if button[1]:
-@@ -1939,6 +1967,100 @@ class KVMController:
+@@ -1939,6 +1975,109 @@ class KVMController:
          except Exception:
              return False
  
@@ -1708,11 +2055,20 @@ index 5c6c5b5..7bb8448 100644
 +        """Connect Finder gestures and native targets to file handoff links."""
 +        if getattr(self, "_file_drag_links", None) is not None:
 +            return
++        self._file_shelf_links = file_shelf.ShelfLinks(Path.home() / "Library" / "Application Support" / "Beamer" / "File Shelf")
 +        self._file_drag_host = file_drag_mac.NativeDragHost()
 +        self._file_drag_links = drag_handoff.DragLinks(self._file_drag_host.begin, allow_incoming=lambda: True)
 +        self.on_file_transfer = self._receive_file_drag
 +        self.on_file_drag = self._begin_file_drag
 +        self.on_file_drag_cancel = self._cancel_file_drag
++
++    def send_shelf_files(self, paths, notify):
++        links = [link for link in self._peers_up.values()
++                 if link.live() and "file_shelf" in link.caps]
++        if len(links) != 1 or self._file_shelf_links is None:
++            notify("Нужен один подключённый компьютер с поддержкой полки.")
++            return False
++        return self._file_shelf_links.send_files(links[0], paths, notify)
 +
 +    def _begin_file_drag(self, paths, step, peer):
 +        peer = peer or self._shortcut_peer()
@@ -1801,7 +2157,7 @@ index 5c6c5b5..7bb8448 100644
      def _handle_local_mouse(self, event_type, event):
          """Crossing lives on the local side of the tap: while the pointer is
          pushing against an armed edge, the event is swallowed and the pointer
-@@ -1949,6 +2071,14 @@ class KVMController:
+@@ -1949,6 +2088,32 @@ class KVMController:
          CROSSING_RETRY_SECONDS or until the next settings save, so one broken
          geometry call cannot log an exception per mouse move -- and a passing
          one cannot leave the edge dead until someone thinks to save a setting."""
@@ -1811,12 +2167,30 @@ index 5c6c5b5..7bb8448 100644
 +        detector = getattr(self, "_file_drag_detector", None)
 +        supported = any("file_transfer" in getattr(link, "caps", ())
 +                        for link in self._peers_up.values())
++        shelf_supported = any("file_shelf" in getattr(link, "caps", ())
++                              for link in self._peers_up.values())
++        if left_drag and detector is not None and shelf_supported:
++            paths = detector.update(True)
++            callback = getattr(self, "on_shelf_drag", None)
++            if paths and callback is not None and not self._shelf_shown_for_press:
++                self._shelf_shown_for_press = True
++                callback()
++            # A held drag belongs to the source application until it is
++            # dropped onto the shelf; do not hand its button to the peer.
++            self.crossing.reset()
++            return event
 +        if left_drag and drag_callback is not None and detector is not None and supported:
 +            paths = detector.update(True)
++            # Do not send an unrecognised held-button gesture to the peer as a
++            # normal cursor crossing. Finder can publish its drag pasteboard
++            # after the first motion event, so wait for a verified selection.
++            if not paths:
++                self.crossing.reset()
++                return event
          if self.home_hold.blocks(self.clock()):
              if event_type in self.translator.movement_event_types:
                  self.home_hold.motion(self.clock())
-@@ -1980,6 +2110,11 @@ class KVMController:
+@@ -1980,6 +2145,11 @@ class KVMController:
              x, y = location[0], location[1]
              dx = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaX)
              dy = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaY)
@@ -1828,7 +2202,7 @@ index 5c6c5b5..7bb8448 100644
              step = self.crossing.feed(
                  x,
                  y,
-@@ -1988,11 +2123,11 @@ class KVMController:
+@@ -1988,11 +2158,11 @@ class KVMController:
                  self._current_desktop_bounds(),
                  self.clock(),
                  notch_range=self.notch_range,
@@ -1842,7 +2216,7 @@ index 5c6c5b5..7bb8448 100644
              )
          except Exception:
              self._crossing_failed = True
-@@ -2001,6 +2136,15 @@ class KVMController:
+@@ -2001,6 +2171,15 @@ class KVMController:
              self.logger.exception("crossing failed; edge switching is off for %.0fs", CROSSING_RETRY_SECONDS)
              return event
          if step.crossed:
@@ -1858,19 +2232,24 @@ index 5c6c5b5..7bb8448 100644
              if self.receiving:
                  # Another machine is driving this Mac and this Mac's own pointer pushed through:
                  # that machine's input goes home first, and this Mac's follows it across once it
-@@ -2368,6 +2512,8 @@ class KVMController:
+@@ -2368,6 +2547,10 @@ class KVMController:
  
      def _drop_up(self, link):
          """The link is no longer one this Mac can send on: forget it and tell the owner."""
 +        if self._file_drag_links is not None:
 +            self._file_drag_links.disconnect(link)
++        if self._file_shelf_links is not None:
++            self._file_shelf_links.disconnect(link)
          peer = link.peer_id
          if peer and self._peers_up.get(peer) is link:
              self._peers_up.pop(peer, None)
-@@ -2534,6 +2680,9 @@ class KVMController:
+@@ -2534,6 +2717,12 @@ class KVMController:
                      # Rebuilt from what was read: the owner sends it on to the machine input is on.
                      clean = protocol.clipboard_msg(read["text"], read["image"])
                      self._step(lambda owner: owner.clipboard_arrived(peer, began, clean))
++            elif kind == file_shelf.SHELF_MESSAGE:
++                if "file_shelf" in link.caps and self._file_shelf_links is not None:
++                    self._file_shelf_links.receive(link, message)
 +            elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
 +                if "file_transfer" in link.caps and self.on_file_transfer is not None:
 +                    self.on_file_transfer(link, message)
@@ -2152,11 +2531,143 @@ index 0000000..14f35f6
 +        panel, self._panel, self._view = self._panel, None, None
 +        if panel is not None:
 +            panel.orderOut_(None)
+diff --git a/mac_app/file_shelf_mac.py b/mac_app/file_shelf_mac.py
+new file mode 100644
+index 0000000..923c91f
+--- /dev/null
++++ b/mac_app/file_shelf_mac.py
+@@ -0,0 +1,100 @@
++"""A small Finder-compatible shelf window for explicit user file drops."""
++from pathlib import Path
++
++import AppKit
++import objc
++from Foundation import NSURL, NSTimer
++from PyObjCTools import AppHelper
++import file_drag_mac
++
++
++class ShelfDropView(AppKit.NSView):
++    def initWithFrame_owner_(self, frame, owner):
++        self = objc.super(ShelfDropView, self).initWithFrame_(frame)
++        if self is not None:
++            self.owner = owner
++            self.registerForDraggedTypes_([AppKit.NSPasteboardTypeFileURL])
++        return self
++
++    def draggingEntered_(self, sender):
++        board = sender.draggingPasteboard()
++        urls = board.readObjectsForClasses_options_([NSURL], {AppKit.NSPasteboardURLReadingFileURLsOnlyKey: True}) or []
++        return AppKit.NSDragOperationCopy if urls and all(u.isFileURL() for u in urls) else AppKit.NSDragOperationNone
++
++    def draggingUpdated_(self, sender):
++        return self.draggingEntered_(sender)
++
++    def performDragOperation_(self, sender):
++        urls = sender.draggingPasteboard().readObjectsForClasses_options_([NSURL], {AppKit.NSPasteboardURLReadingFileURLsOnlyKey: True}) or []
++        paths = [Path(str(url.path())) for url in urls if url.isFileURL()]
++        if not paths or len(paths) != len(urls) or not all(p.is_file() and not p.is_symlink() for p in paths):
++            return False
++        self.owner.send(paths)
++        return True
++
++
++class ShelfFileButton(AppKit.NSButton):
++    def mouseDown_(self, event):
++        if not self.file_path or not Path(self.file_path).is_file():
++            return
++        file_drag_mac.start_drag(self, event, self, [self.file_path])
++
++    def draggingSession_sourceOperationMaskForDraggingContext_(self, session, context):
++        return AppKit.NSDragOperationCopy
++
++    def draggingSession_endedAtPoint_operation_(self, session, point, operation):
++        pass
++
++
++class ShelfWindow(AppKit.NSObject):
++    def initWithShelf_sender_(self, shelf, sender):
++        self = objc.super(ShelfWindow, self).init()
++        if self is None:
++            return None
++        self.shelf, self.sender = shelf, sender
++        self.last_files = None
++        rect = AppKit.NSMakeRect(80, 120, 320, 240)
++        style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable | AppKit.NSWindowStyleMaskNonactivatingPanel
++        self.panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, style, AppKit.NSBackingStoreBuffered, False)
++        self.panel.setTitle_("Полка файлов Beamer")
++        self.panel.setFloatingPanel_(True)
++        self.panel.setLevel_(AppKit.NSFloatingWindowLevel)
++        self.view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 320, 240), self)
++        self.panel.setContentView_(self.view)
++        self.header = AppKit.NSTextField.labelWithString_("Перетащите файл сюда или заберите полученный")
++        self.header.setFrame_(AppKit.NSMakeRect(12, 205, 296, 24))
++        self.view.addSubview_(self.header)
++        self.status = AppKit.NSTextField.labelWithString_("")
++        self.status.setFrame_(AppKit.NSMakeRect(12, 12, 296, 22))
++        self.view.addSubview_(self.status)
++        self.rows = []
++        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.8, self, "refresh:", None, True)
++        self.refresh_(None)
++        return self
++
++    @objc.python_method
++    def show(self):
++        self.panel.orderFrontRegardless()
++
++    @objc.python_method
++    def send(self, paths):
++        self.sender(paths, lambda text: AppHelper.callAfter(self.status.setStringValue_, text))
++
++    def refresh_(self, _timer):
++        files = self.shelf.list_files()
++        if files == self.last_files:
++            return
++        had_files = self.last_files is not None and len(files) > len(self.last_files)
++        self.last_files = files
++        for row in self.rows:
++            row.removeFromSuperview()
++        self.rows = []
++        for index, path in enumerate(files[-6:]):
++            row = ShelfFileButton.alloc().initWithFrame_(AppKit.NSMakeRect(12, 172 - index * 25, 296, 24))
++            row.file_path = str(path)
++            row.setTitle_(path.name)
++            row.setToolTip_(str(path))
++            self.view.addSubview_(row)
++            self.rows.append(row)
++        if had_files:
++            self.show()
 diff --git a/mac_app/kvm_bridge_app.py b/mac_app/kvm_bridge_app.py
-index 49ea3f8..022cb16 100644
+index 49ea3f8..f6bb3fb 100644
 --- a/mac_app/kvm_bridge_app.py
 +++ b/mac_app/kvm_bridge_app.py
-@@ -5774,6 +5774,7 @@ def main(argv=None):
+@@ -2353,6 +2353,15 @@ class ControlWindow(AppKit.NSObject):
+     def _overview_page(self, body):
+         # Pairing stays at the top even when machines are already paired.
+         self.overview_body = body
++        if getattr(self.controller, "_file_shelf_links", None) is not None:
++            import file_shelf_mac
++            self.file_shelf_window = file_shelf_mac.ShelfWindow.alloc().initWithShelf_sender_(
++                self.controller._file_shelf_links.shelf, self.controller.send_shelf_files)
++            self.controller.on_shelf_drag = lambda: AppHelper.callAfter(self.file_shelf_window.show)
++            shelf_module = widgets.Module()
++            shelf_module.add(widgets.Label("Полка файлов", theme.TYPE["body"]).view)
++            shelf_module.add(widgets.Button("Открыть полку файлов", self, "openFileShelf:").view)
++            widgets.add(body, shelf_module.view)
+         widgets.add(body, self.panel.machines_module.view)
+         widgets.add(body, self.panel.own_name_module().view)
+         widgets.add(body, self.panel.sheet.view)
+@@ -2363,6 +2372,9 @@ class ControlWindow(AppKit.NSObject):
+         widgets.add(body, self._login_module().view)
+         widgets.add(body, self._updates_module().view)
+ 
++    def openFileShelf_(self, _sender):
++        self.file_shelf_window.show()
++
+     @objc.python_method
+     def _rename_own(self, text):
+         raw = copy.deepcopy(self.settings_store.current())
+@@ -5774,6 +5786,7 @@ def main(argv=None):
      install(cfg.language)
      book, identity = bridge.links_from_store(settings_store, VERSION)
      controller = WakingController(cfg, logger=logger, book=book, identity=identity, hardware=hardware_mac.hardware_address_towards)
@@ -2164,12 +2675,44 @@ index 49ea3f8..022cb16 100644
      app = TrayApp(controller, settings_store, logger, hidden=args.hidden)
      instance_server = InstanceSignalServer(
          instance_socket_path(), lambda: AppHelper.callAfter(app.open_window, None)
+diff --git a/mac_app/preview_launcher.py b/mac_app/preview_launcher.py
+index 0609f98..83e3538 100644
+--- a/mac_app/preview_launcher.py
++++ b/mac_app/preview_launcher.py
+@@ -31,6 +31,8 @@ def self_test(report_path):
+         cfg = settings_store.editable_default_config()
+         controller = WakingController(cfg, logger=logging.getLogger("beamer-smoke"))
+         controller.start_input_capture = lambda: None
++        from core.file_shelf import ShelfLinks
++        controller._file_shelf_links = ShelfLinks(Path(folder) / "shelf")
+         control = kvm_bridge_app.ControlWindow.alloc().initWithController_settingsStore_logger_(
+             controller, store, logging.getLogger("beamer-smoke"))
+         for page in control.pages:
+@@ -38,6 +40,10 @@ def self_test(report_path):
+             control.window.contentView().layoutSubtreeIfNeeded()
+         assert not control.window.isVisible()
+         assert hasattr(control, "keyboard_sync_box")
++        assert hasattr(control, "file_shelf_window")
++        control.file_shelf_window.timer.invalidate()
++        control.file_shelf_window.panel.close()
++        controller._file_shelf_links.close()
+         ui_pages = list(control.pages)
+     Path(report_path).write_text(json.dumps({
+         "version": kvm_bridge_app.VERSION,
+@@ -45,6 +51,7 @@ def self_test(report_path):
+         "russian_settings_label": i18n.tr("Settings"),
+         "native_input_language_read": keyboard_layout.current_language(),
+         "frozen": bool(getattr(sys, "frozen", False)),
++        "file_shelf_created": True,
+         "native_ui_pages_created_offscreen": ui_pages,
+     }, ensure_ascii=False, indent=2), encoding="utf-8")
+     raise SystemExit(0)
 diff --git a/mac_app/tests/test_file_drag_bridge.py b/mac_app/tests/test_file_drag_bridge.py
 new file mode 100644
-index 0000000..d4c2968
+index 0000000..89971b9
 --- /dev/null
 +++ b/mac_app/tests/test_file_drag_bridge.py
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,189 @@
 +import threading
 +import unittest
 +from collections import deque
@@ -2278,6 +2821,22 @@ index 0000000..d4c2968
 +        self.assertFalse(controller.redirecting)
 +        self.assertFalse(engine.feed.call_args.kwargs["dragging"])
 +        self.assertTrue(engine.feed.call_args.kwargs["ready"](peer))
++
++    def test_pending_file_detection_does_not_cross_with_mouse_held(self):
++        controller = make_controller(FakeClock())
++        self.addCleanup(controller.stop_event.set)
++        peer = "peer"
++        engine = mock.Mock(armed=True, peers=[peer])
++        controller.crossing = engine
++        controller._peers_up[peer] = SimpleNamespace(caps={"file_transfer"})
++        controller._file_drag_detector = SimpleNamespace(update=lambda _: ())
++        controller.on_file_drag = mock.Mock()
++        event = {"location": (1919, 100), FakeQuartz.kCGMouseEventDeltaX: 20}
++        self.assertIs(controller._handle_local_mouse(FakeQuartz.kCGEventLeftMouseDragged, event), event)
++        engine.reset.assert_called_once()
++        engine.feed.assert_not_called()
++        controller.on_file_drag.assert_not_called()
++        self.assertFalse(controller.redirecting)
 +
 +    def test_file_drag_does_not_choose_an_older_peer(self):
 +        controller = make_controller(FakeClock())
@@ -2405,10 +2964,10 @@ index 0000000..c9570c5
 +                view.beginDraggingSessionWithItems_event_source_.assert_called_once_with([item], event, source)
 +                item.setDraggingFrame_contents_.assert_called_once()
 diff --git a/mac_app/windows_input.py b/mac_app/windows_input.py
-index 5b3d931..03ba298 100644
+index 5b3d931..b20dc76 100644
 --- a/mac_app/windows_input.py
 +++ b/mac_app/windows_input.py
-@@ -72,6 +72,10 @@ class WindowsInput:
+@@ -72,6 +72,14 @@ class WindowsInput:
              settings_callback=self._on_settings,
              paired_callback=self._on_paired,
              identify_callback=controller.receive_identify_screens,
@@ -2416,6 +2975,10 @@ index 5b3d931..03ba298 100644
 +                           if getattr(controller, "_file_drag_links", None) is not None else None),
 +            file_disconnected_callback=(controller._file_drag_links.disconnect
 +                                        if getattr(controller, "_file_drag_links", None) is not None else None),
++            shelf_callback=(controller._file_shelf_links.receive
++                            if getattr(controller, "_file_shelf_links", None) is not None else None),
++            shelf_disconnected_callback=(controller._file_shelf_links.disconnect
++                                         if getattr(controller, "_file_shelf_links", None) is not None else None),
              link_callback=self._on_link,
              announce=self._announce,
          )
@@ -2545,32 +3108,123 @@ index 0000000..7bf308e
 +            release()
 +        else:
 +            self.files_retained.emit(paths, release)
+diff --git a/win_app/file_shelf_win.py b/win_app/file_shelf_win.py
+new file mode 100644
+index 0000000..5de7d97
+--- /dev/null
++++ b/win_app/file_shelf_win.py
+@@ -0,0 +1,82 @@
++"""Small Windows shelf using real Qt/Explorer file drag events."""
++from pathlib import Path
++from PySide6.QtCore import Qt, QTimer, QUrl, QMimeData, Signal
++from PySide6.QtGui import QDrag
++from PySide6.QtWidgets import QAbstractItemView, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
++
++
++class ShelfList(QListWidget):
++    def __init__(self, dropped):
++        super().__init__()
++        self._dropped = dropped
++        self.setAcceptDrops(True)
++        self.setDragEnabled(True)
++        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
++        self.setDefaultDropAction(Qt.DropAction.CopyAction)
++
++    def dragEnterEvent(self, event):
++        if event.mimeData().hasUrls() and all(u.isLocalFile() for u in event.mimeData().urls()):
++            event.acceptProposedAction()
++        else:
++            event.ignore()
++
++    def dragMoveEvent(self, event):
++        self.dragEnterEvent(event)
++
++    def dropEvent(self, event):
++        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
++        if paths and all(p.is_file() and not p.is_symlink() for p in paths):
++            self._dropped(paths)
++            event.setDropAction(Qt.DropAction.CopyAction)
++            event.accept()
++        else:
++            event.ignore()
++
++    def startDrag(self, _actions):
++        paths = [i.data(Qt.ItemDataRole.UserRole) for i in self.selectedItems()]
++        if not paths:
++            return
++        mime = QMimeData()
++        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
++        drag = QDrag(self)
++        drag.setMimeData(mime)
++        drag.exec(Qt.DropAction.CopyAction)
++
++
++class ShelfWindow(QWidget):
++    status_changed = Signal(str)
++    def __init__(self, shelf, send, parent=None):
++        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
++        self.shelf, self.send = shelf, send
++        self.setWindowTitle("Полка файлов Beamer")
++        self.resize(300, 220)
++        layout = QVBoxLayout(self)
++        layout.addWidget(QLabel("Перетащите файл сюда или заберите полученный файл"))
++        self.status = QLabel("")
++        self.status_changed.connect(self.status.setText)
++        self.list = ShelfList(self._drop)
++        layout.addWidget(self.list)
++        layout.addWidget(self.status)
++        self._last = None
++        self.timer = QTimer(self)
++        self.timer.setInterval(800)
++        self.timer.timeout.connect(self.refresh)
++        self.timer.start()
++        self.refresh()
++
++    def _drop(self, paths):
++        self.send(paths, self.status_changed.emit)
++
++    def refresh(self):
++        files = self.shelf.list_files()
++        if files == self._last:
++            return
++        self._last = files
++        self.list.clear()
++        for path in files:
++            item = QListWidgetItem(path.name)
++            item.setToolTip(str(path))
++            item.setData(Qt.ItemDataRole.UserRole, str(path))
++            self.list.addItem(item)
++        if files and not self.isVisible():
++            self.show()
 diff --git a/win_app/kvm_bridge_win.py b/win_app/kvm_bridge_win.py
-index abb6c37..b8b3124 100644
+index abb6c37..239da4f 100644
 --- a/win_app/kvm_bridge_win.py
 +++ b/win_app/kvm_bridge_win.py
-@@ -64,6 +64,8 @@ from app_config import (
+@@ -64,6 +64,9 @@ from app_config import (
      save_config,
  )
  from core import crash_log
 +from core import drag_handoff
++from core import file_shelf
 +from core import drag_coordinator
  from core import portable_runtime
  from core.portable_store import PortableStore, PortableStoreError
  from core.capture_types import DeadKey, TextInput
-@@ -344,6 +346,8 @@ class StatusBridge(QObject):
+@@ -344,6 +347,9 @@ class StatusBridge(QObject):
      update = Signal(object)
      update_check = Signal(str, object)
      permission = Signal(str, str, str, bool)
 +    file_drag_edge = Signal(object, object, object, object, object, object)
 +    file_drag_local_edge = Signal(object, object, object, object, object)
++    file_shelf_show = Signal()
  
  
  def _instance_server_name() -> str:
-@@ -621,6 +625,23 @@ class WindowsApplication(QWidget):
+@@ -621,6 +627,24 @@ class WindowsApplication(QWidget):
              lambda settings: app_config.write_settings(self.config_path, settings),
              app_config.SETTINGS_LOCK,
          )
++        self._file_shelf_links = file_shelf.ShelfLinks(self.config_path.parent / "File Shelf") if sys.platform == "win32" else None
 +        self._file_drag_host = None
 +        self._file_drag_links = None
 +        self._file_drag_probe = None
@@ -2591,29 +3245,33 @@ index abb6c37..b8b3124 100644
          self.server = LinkResponder(
              self.book,
              self._identity,
-@@ -636,6 +657,10 @@ class WindowsApplication(QWidget):
+@@ -636,6 +660,12 @@ class WindowsApplication(QWidget):
              ),
              settings_callback=lambda peer, data: self.bridge.settings.emit(protocol.id_text(peer), data),
              identify_callback=self._receive_identify_screens,
 +            file_callback=self._file_drag_links.receive if self._file_drag_links else None,
 +            file_disconnected_callback=self._file_drag_links.disconnect if self._file_drag_links else None,
++            shelf_callback=self._file_shelf_links.receive if self._file_shelf_links else None,
++            shelf_disconnected_callback=self._file_shelf_links.disconnect if self._file_shelf_links else None,
 +            file_drag_edge_callback=self.bridge.file_drag_edge.emit if self._file_drag_links else None,
 +            file_drag_release_callback=self._file_drag_release if self._file_drag_links else None,
              paired_callback=self._store_paired,
              link_callback=lambda peer, up: self.bridge.peers_changed.emit(),
              announce=self._announce,
-@@ -672,6 +697,10 @@ class WindowsApplication(QWidget):
+@@ -672,6 +702,12 @@ class WindowsApplication(QWidget):
          app.screenRemoved.connect(self._displays_changed)
          self._refresh_own_displays()
          self.sender.driven = lambda: self.server.driven
 +        if self._file_drag_links is not None:
 +            self.sender.file_transfer_callback = self._receive_outbound_file_drag
++            self.sender.file_shelf_callback = self._receive_outbound_file_shelf
++            self.sender.file_shelf_drag_callback = self.bridge.file_shelf_show.emit
 +            self.sender.file_drag_edge_callback = self.bridge.file_drag_local_edge.emit
 +            self.sender.file_drag_release_callback = self._file_drag_local_release
          self.resistance_pressure_timer = QTimer(self)
          self.resistance_pressure_timer.setInterval(33)
          self.resistance_pressure_timer.timeout.connect(self._refresh_local_pressure)
-@@ -684,7 +713,7 @@ class WindowsApplication(QWidget):
+@@ -684,7 +720,7 @@ class WindowsApplication(QWidget):
              protocol.id_text(peer), read["edge"], read["set_at"], protocol.id_text(read["by"]), read.get("way_back"),
              protocol.id_text(read["way_back_by"]) if read.get("way_back_by") else None
          )
@@ -2622,7 +3280,30 @@ index abb6c37..b8b3124 100644
          self.sender.paired_callback = self._store_paired
          self.sender.hw_learned = self._learn_peer_hardware
          self.sender.announce = self._announce
-@@ -1944,6 +1973,106 @@ class WindowsApplication(QWidget):
+@@ -789,6 +825,11 @@ class WindowsApplication(QWidget):
+         self.setWindowIcon(QIcon(str(ICON_PATH)))
+         self.preview_loop = PreviewLoop(self)
+         self.tile_hover = TileHover(self.preview_loop, self)
++        self.file_shelf_window = None
++        if self._file_shelf_links is not None:
++            from file_shelf_win import ShelfWindow
++            self.file_shelf_window = ShelfWindow(self._file_shelf_links.shelf, self._send_shelf_files)
++            self.bridge.file_shelf_show.connect(self.file_shelf_window.show)
+         self._build_window()
+         self._apply_theme()
+         self._build_tray()
+@@ -963,6 +1004,10 @@ class WindowsApplication(QWidget):
+             on_pin=self._set_peer_pin,
+         )
+         layout.addWidget(self.machines)
++        if self.file_shelf_window is not None:
++            shelf_button = QPushButton("Открыть полку файлов")
++            shelf_button.clicked.connect(self.file_shelf_window.show)
++            layout.addWidget(shelf_button)
+         layout.addWidget(self._name_module(current))
+         self.sheet = machines_win.PairingSheet(
+             self._show_code, self._cancel_code, self._pair_clicked, self._pick_machine,
+@@ -1944,6 +1989,124 @@ class WindowsApplication(QWidget):
                                              self._peer_caps().get(peer, ())))
          return messages
  
@@ -2719,28 +3400,46 @@ index abb6c37..b8b3124 100644
 +        self._file_drag_links.session(link, post=lambda record: self.sender.post_file_ordered(peer, record))
 +        self._file_drag_links.receive(link, message)
 +
++    def _send_shelf_files(self, paths, notify):
++        links = [self.sender.links._link(peer) for peer in self.sender.peers_up()
++                 if "file_shelf" in self.sender.links.caps(peer)]
++        links = [link for link in links if link is not None and link.live()]
++        if len(links) != 1 or self._file_shelf_links is None:
++            notify("Нужен один подключённый компьютер с поддержкой полки.")
++            return False
++        self._file_drag_outbound_links[protocol.read_id(links[0].peer_id)] = links[0]
++        return self._file_shelf_links.send_files(links[0], paths, notify)
++
++    def _receive_outbound_file_shelf(self, peer, message):
++        link = self.sender.links._link(peer)
++        if link is not None and self._file_shelf_links is not None:
++            self._file_drag_outbound_links[peer] = link
++            self._file_shelf_links.receive(link, message)
++
 +    def _file_drag_link_changed(self, peer, up):
 +        if not up and self._file_drag_links is not None:
 +            link = self._file_drag_outbound_links.pop(peer, None)
 +            if link is not None:
 +                self._file_drag_links.disconnect(link)
++                if self._file_shelf_links is not None:
++                    self._file_shelf_links.disconnect(link)
 +        self.bridge.peers_changed.emit()
 +
      def _driver_platform(self) -> str:
          """The platform of the machine driving this PC now, or "" when none is. From the peers the
          window last read, not settings.json: this runs on the responder's thread as input lands."""
-@@ -1963,8 +2092,8 @@ class WindowsApplication(QWidget):
+@@ -1963,8 +2126,8 @@ class WindowsApplication(QWidget):
              "platform": OWN_PLATFORM,
              "app": VERSION[:32] if VERSION.isascii() and VERSION.isprintable() else "dev",
              # A swipe has no shortcut every Linux desktop shares, so Linux does not offer gestures.
 -            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language")
 -                     if not (cap in ("gestures", "input_language") and OWN_PLATFORM == "linux")],
-+            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language", "file_transfer")
-+                     if not (cap in ("gestures", "input_language", "file_transfer") and OWN_PLATFORM == "linux")],
++            "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "profiles", "displays", "identify_screens", "ping_rtt", "motion_path", "input_language", "file_shelf")
++                     if not (cap in ("gestures", "input_language", "file_transfer", "file_shelf") and OWN_PLATFORM == "linux")],
              "port": self._settings_port,
          }
  
-@@ -5171,6 +5300,12 @@ class WindowsApplication(QWidget):
+@@ -5171,6 +5334,14 @@ class WindowsApplication(QWidget):
          # refresh rather than letting its hooks and this copy's hooks keep running together.
          self._input_controller_blocked = True
          self.server.stop()
@@ -2750,10 +3449,12 @@ index abb6c37..b8b3124 100644
 +            self._file_drag_coordinator.close()
 +        if getattr(self, "_file_drag_links", None) is not None:
 +            self._file_drag_links.close()
++        if getattr(self, "_file_shelf_links", None) is not None:
++            self._file_shelf_links.close()
          self._stop_sending()
          release, self._input_controller_release = self._input_controller_release, None
          release()
-@@ -5466,6 +5601,12 @@ class WindowsApplication(QWidget):
+@@ -5466,6 +5637,14 @@ class WindowsApplication(QWidget):
              self.pairing.cancel_nearby()
              self.pairing.stop()
          self.server.stop()
@@ -2763,34 +3464,46 @@ index abb6c37..b8b3124 100644
 +            self._file_drag_coordinator.close()
 +        if getattr(self, "_file_drag_links", None) is not None:
 +            self._file_drag_links.close()
++        if getattr(self, "_file_shelf_links", None) is not None:
++            self._file_shelf_links.close()
          self._stop_sending()
          shortcut = getattr(self, "global_shortcut", None)
          if shortcut is not None:
 diff --git a/win_app/sender.py b/win_app/sender.py
-index de19d8a..57bfb9b 100644
+index de19d8a..a39b56f 100644
 --- a/win_app/sender.py
 +++ b/win_app/sender.py
-@@ -28,6 +28,8 @@ import time
+@@ -28,6 +28,9 @@ import time
  from typing import Callable, Optional
  
  from core import keyboard_sync
 +from core import file_transfer
++from core import file_shelf
 +from core import drag_handoff
  import keyboard_language
  from core import ignored
  from core import keytable
-@@ -250,6 +252,10 @@ class LinkSender:
+@@ -250,6 +253,13 @@ class LinkSender:
          self.arrangement_callback: Optional[Callable] = None
          self.settings_callback: Optional[Callable] = None
          self.identify_callback: Optional[Callable] = None
 +        self.file_transfer_callback: Optional[Callable] = None
++        self.file_shelf_callback: Optional[Callable] = None
++        self.file_shelf_drag_callback: Optional[Callable] = None
++        self._file_shelf_shown = False
 +        self.file_drag_edge_callback: Optional[Callable] = None
 +        self.file_drag_release_callback: Optional[Callable] = None
 +        self._file_drag_probe_at = float("-inf")
          self.paired_callback: Optional[Callable] = None
          self.link_callback: Optional[Callable[[bytes, bool], None]] = None
  
-@@ -699,6 +705,8 @@ class LinkSender:
+@@ -695,10 +705,14 @@ class LinkSender:
+ 
+     def on_button(self, name: str, down: bool) -> bool:
+         """A mouse button, from the hook thread: True when it is not for this PC."""
++        if name == "left" and down:
++            self._file_shelf_shown = False
+         if down:
              self._buttons_held.add(name)
          else:
              self._buttons_held.discard(name)
@@ -2799,7 +3512,23 @@ index de19d8a..57bfb9b 100644
          if self._shake_detector is not None:
              self._shake_detector.held(self._clock(), bool(self._buttons_held or self._keys_down))
          owner = self._owner
-@@ -828,7 +836,9 @@ class LinkSender:
+@@ -745,6 +759,15 @@ class LinkSender:
+     def on_motion(self, dx: int, dy: int) -> None:
+         """One raw mouse movement, in the mouse's own counts. Consumes nothing: raw input cannot
+         block an event, so the hook above is what keeps the movement off this PC."""
++        if (not self.redirecting and "left" in self._buttons_held and not self._file_shelf_shown
++                and self.file_shelf_drag_callback is not None
++                and any("file_shelf" in self.links.caps(peer) for peer in self.peers_up())):
++            self._file_shelf_shown = True
++            self._call(self.file_shelf_drag_callback)
++        if (not self.redirecting and "left" in self._buttons_held
++                and self.file_shelf_drag_callback is not None
++                and any("file_shelf" in self.links.caps(peer) for peer in self.peers_up())):
++            return
+         if self.redirecting:
+             if not self._live():
+                 self._lost()
+@@ -828,7 +851,9 @@ class LinkSender:
          if ((self._home_hold is not None and self._home_hold.blocks(self._clock()))
                  or not self._models or self.edges_held or self._owner is None):
              return
@@ -2810,7 +3539,7 @@ index de19d8a..57bfb9b 100644
              # A drag that reaches the edge is dragging, not leaving: the push so far is dropped,
              # as the Mac drops it, so letting go at the edge does not finish a crossing.
              for _peer, model in self._models:
-@@ -848,6 +858,8 @@ class LinkSender:
+@@ -848,6 +873,8 @@ class LinkSender:
              outcome = model = target = None
              display_map = self._cached_display_map()
              for peer, candidate in list(self._models):
@@ -2819,7 +3548,7 @@ index de19d8a..57bfb9b 100644
                  result = candidate.feed(monitors, pointer, float(dx), float(dy), display_map=display_map)
                  if result.action != return_edge.PASS:
                      outcome, model, target = result, candidate, peer
-@@ -868,6 +880,13 @@ class LinkSender:
+@@ -868,6 +895,13 @@ class LinkSender:
          self._notify_pressure(model.edge, outcome.pressure, outcome.action == return_edge.CROSS, part)
          if outcome.action == return_edge.CROSS:
              offset = receiver.corner_offset(model.corner, model.edge) if isinstance(model, return_edge.CornerPush) else outcome.offset
@@ -2833,7 +3562,7 @@ index de19d8a..57bfb9b 100644
              # The model names the edge on the far side, not the one just left: it is the same
              # border, read from the other end. The display it leads to lands the pointer there, as
              # the Mac's own crossing does.
-@@ -943,6 +962,31 @@ class LinkSender:
+@@ -943,6 +977,31 @@ class LinkSender:
             display=None, side=None) -> bool:
          return self._go(peer, edge, offset, display, side)
  
@@ -2865,10 +3594,13 @@ index de19d8a..57bfb9b 100644
      def _go(self, peer: bytes, edge=None, offset=None, display=None, side=None) -> bool:
          owner = self._owner
          if owner is None:
-@@ -1060,6 +1104,9 @@ class LinkSender:
+@@ -1060,6 +1119,12 @@ class LinkSender:
                      actions = self._owner.clipboard_arrived(peer, began_at if began_at is not None else self._clock(), clean)
                      self._queue(actions)
                  self._report(actions)
++        elif kind == file_shelf.SHELF_MESSAGE:
++            if "file_shelf" in self.links.caps(peer) and self.file_shelf_callback is not None:
++                self._call(self.file_shelf_callback, peer, message)
 +        elif kind in file_transfer.FILE_TYPES | drag_handoff.DRAG_TYPES:
 +            if "file_transfer" in self.links.caps(peer) and self.file_transfer_callback is not None:
 +                self._call(self.file_transfer_callback, peer, message)
@@ -2956,6 +3688,63 @@ index 0000000..b1bea2d
 +            app.processEvents()
 +        start.assert_called_once()
 +        release.assert_called_once()
+diff --git a/win_app/tests/test_file_shelf_win.py b/win_app/tests/test_file_shelf_win.py
+new file mode 100644
+index 0000000..3bbcc84
+--- /dev/null
++++ b/win_app/tests/test_file_shelf_win.py
+@@ -0,0 +1,51 @@
++import tempfile
++import unittest
++from pathlib import Path
++from unittest import mock
++
++from PySide6.QtCore import QMimeData, QUrl, Qt
++from PySide6.QtWidgets import QApplication
++from core.file_shelf import FileShelf
++from file_shelf_win import ShelfWindow
++
++
++class ShelfWindowTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def test_drop_accepts_regular_file_and_ignores_directory(self):
++        with tempfile.TemporaryDirectory() as root:
++            path = Path(root) / "test.txt"
++            path.write_text("hello")
++            send = mock.Mock()
++            window = ShelfWindow(FileShelf(Path(root) / "shelf"), send)
++            self.addCleanup(window.close)
++            self.addCleanup(window.timer.stop)
++            mime = QMimeData()
++            mime.setUrls([QUrl.fromLocalFile(str(path))])
++            event = mock.Mock()
++            event.mimeData.return_value = mime
++            window.list.dropEvent(event)
++            send.assert_called_once()
++            self.assertEqual(send.call_args.args[0], [path])
++            event.accept.assert_called_once()
++            event.reset_mock()
++            send.reset_mock()
++            mime.setUrls([QUrl.fromLocalFile(root)])
++            window.list.dropEvent(event)
++            event.ignore.assert_called_once()
++            send.assert_not_called()
++
++    def test_completed_file_becomes_a_draggable_shelf_row(self):
++        with tempfile.TemporaryDirectory() as root:
++            source = Path(root) / "данные.txt"
++            source.write_text("test", encoding="utf8")
++            shelf = FileShelf(Path(root) / "shelf")
++            window = ShelfWindow(shelf, mock.Mock())
++            self.addCleanup(window.close)
++            self.addCleanup(window.timer.stop)
++            stored = shelf.store_copy(source)
++            window.refresh()
++            self.assertEqual(window.list.count(), 1)
++            self.assertEqual(window.list.item(0).data(Qt.ItemDataRole.UserRole), str(stored))
 diff --git a/win_app/tests/test_links.py b/win_app/tests/test_links.py
 index 3978539..1a1c468 100644
 --- a/win_app/tests/test_links.py

@@ -394,10 +394,10 @@ index 0000000..2585323
 +            dispatcher.close()
 diff --git a/core/file_shelf.py b/core/file_shelf.py
 new file mode 100644
-index 0000000..2e19be7
+index 0000000..68b9a60
 --- /dev/null
 +++ b/core/file_shelf.py
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,204 @@
 +"""A local file shelf and a separate, authenticated peer transfer session.
 +
 +Transport adapters must only deliver messages received over an authenticated
@@ -414,6 +414,7 @@ index 0000000..2e19be7
 +from pathlib import Path
 +
 +from . import file_transfer
++from .i18n import tr
 +
 +SHELF_MESSAGE = "file_shelf"
 +
@@ -543,26 +544,26 @@ index 0000000..2e19be7
 +    def send_files(self, link, paths, notify):
 +        paths = tuple(Path(path) for path in paths)
 +        if not paths or not all(path.is_file() and not path.is_symlink() for path in paths):
-+            notify("Выберите обычные файлы.")
++            notify(tr("Choose regular files."))
 +            return False
 +        with self._lock:
 +            if self._closed:
-+                notify("Полка закрыта.")
++                notify(tr("File shelf is closed."))
 +                return False
 +            if link in self._sending:
-+                notify("Дождитесь завершения предыдущей передачи.")
++                notify(tr("Wait for the previous transfer to finish."))
 +                return False
 +            self._sending.add(link)
 +        def run():
 +            try:
-+                notify("Передача файлов…")
++                notify(tr("Transferring files…"))
 +                session = self.session(link)
 +                for path in paths:
 +                    stored = self.shelf.store_copy(path)
 +                    session.send_file(stored)
-+                notify("Файлы переданы.")
++                notify(tr("Files transferred."))
 +            except Exception:
-+                notify("Не удалось передать файлы. Проверьте соединение и повторите.")
++                notify(tr("Could not transfer files. Check the connection and try again."))
 +            finally:
 +                with self._lock:
 +                    self._sending.discard(link)
@@ -1961,8 +1962,236 @@ index 0000000..75c070f
 +
 +The native Finder and Windows Explorer integration must be tested on actual
 +macOS and Windows desktops before this preview is treated as a release.
+diff --git a/locales/beamer.pot b/locales/beamer.pot
+index 8949651..885ff4b 100644
+--- a/locales/beamer.pot
++++ b/locales/beamer.pot
+@@ -162,6 +162,30 @@ msgstr ""
+ msgid "Same as crossing"
+ msgstr ""
+ 
++#: core/file_shelf.py
++msgid "Choose regular files."
++msgstr ""
++
++#: core/file_shelf.py
++msgid "File shelf is closed."
++msgstr ""
++
++#: core/file_shelf.py
++msgid "Wait for the previous transfer to finish."
++msgstr ""
++
++#: core/file_shelf.py
++msgid "Transferring files…"
++msgstr ""
++
++#: core/file_shelf.py
++msgid "Files transferred."
++msgstr ""
++
++#: core/file_shelf.py
++msgid "Could not transfer files. Check the connection and try again."
++msgstr ""
++
+ #: core/fx_folio.py
+ msgid "Crease"
+ msgstr ""
+@@ -1297,6 +1321,10 @@ msgstr ""
+ msgid "Beamer"
+ msgstr ""
+ 
++#: mac_app/bridge.py win_app/kvm_bridge_win.py
++msgid "Connect exactly one device that supports the file shelf."
++msgstr ""
++
+ #: mac_app/bridge.py
+ msgid "Input returned to this Mac"
+ msgstr ""
+@@ -1533,6 +1561,14 @@ msgstr ""
+ msgid "{label}, this Mac."
+ msgstr ""
+ 
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Beamer file shelf"
++msgstr ""
++
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Drop files here or drag a received file out"
++msgstr ""
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Input on this Mac"
+ msgstr ""
+@@ -2512,6 +2548,14 @@ msgstr ""
+ msgid "On a PC, each key arrives as the key in its place, so Command arrives as the Windows key. Between two Macs every key arrives as itself."
+ msgstr ""
+ 
++#: mac_app/kvm_bridge_app.py
++msgid "File shelf"
++msgstr ""
++
++#: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
++msgid "Open file shelf"
++msgstr ""
++
+ #: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
+ msgid "On"
+ msgstr ""
+diff --git a/locales/it.po b/locales/it.po
+index b56490c..36da6ff 100644
+--- a/locales/it.po
++++ b/locales/it.po
+@@ -164,6 +164,30 @@ msgstr "Un quarto"
+ msgid "Same as crossing"
+ msgstr "Come il passaggio"
+ 
++#: core/file_shelf.py
++msgid "Choose regular files."
++msgstr "Scegli file regolari."
++
++#: core/file_shelf.py
++msgid "File shelf is closed."
++msgstr "Lo scaffale file è chiuso."
++
++#: core/file_shelf.py
++msgid "Wait for the previous transfer to finish."
++msgstr "Attendi la fine del trasferimento precedente."
++
++#: core/file_shelf.py
++msgid "Transferring files…"
++msgstr "Trasferimento file…"
++
++#: core/file_shelf.py
++msgid "Files transferred."
++msgstr "File trasferiti."
++
++#: core/file_shelf.py
++msgid "Could not transfer files. Check the connection and try again."
++msgstr "Impossibile trasferire i file. Controlla la connessione e riprova."
++
+ #: core/fx_folio.py
+ msgid "Crease"
+ msgstr "Piega"
+@@ -1299,6 +1323,10 @@ msgstr "l'altro computer"
+ msgid "Beamer"
+ msgstr "Beamer"
+ 
++#: mac_app/bridge.py win_app/kvm_bridge_win.py
++msgid "Connect exactly one device that supports the file shelf."
++msgstr "Connetti un solo dispositivo che supporti lo scaffale file."
++
+ #: mac_app/bridge.py
+ msgid "Input returned to this Mac"
+ msgstr "L'input è tornato a questo Mac"
+@@ -1541,6 +1569,14 @@ msgstr "{label}, {name}, questo Mac."
+ msgid "{label}, this Mac."
+ msgstr "{label}, questo Mac."
+ 
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Beamer file shelf"
++msgstr "Scaffale file Beamer"
++
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Drop files here or drag a received file out"
++msgstr "Trascina qui i file o sposta fuori un file ricevuto"
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Input on this Mac"
+ msgstr "Input su questo Mac"
+@@ -2561,6 +2597,14 @@ msgstr "Su un PC, Comando arriva come Ctrl, quindi Comando-C copia anche lì, e
+ msgid "On a PC, each key arrives as the key in its place, so Command arrives as the Windows key. Between two Macs every key arrives as itself."
+ msgstr "Su un PC, ogni tasto arriva come il tasto nella stessa posizione, quindi Comando arriva come tasto Windows. Tra due Mac ogni tasto arriva com'è."
+ 
++#: mac_app/kvm_bridge_app.py
++msgid "File shelf"
++msgstr "Scaffale file"
++
++#: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
++msgid "Open file shelf"
++msgstr "Apri scaffale file"
++
+ # New in 1.5.5: awaiting Lorenzo's check
+ #: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
+ msgid "On"
+diff --git a/locales/ru.po b/locales/ru.po
+index bd44698..e363660 100644
+--- a/locales/ru.po
++++ b/locales/ru.po
+@@ -164,6 +164,30 @@ msgstr "Четверть"
+ msgid "Same as crossing"
+ msgstr "Как при переходе"
+ 
++#: core/file_shelf.py
++msgid "Choose regular files."
++msgstr "Выберите обычные файлы."
++
++#: core/file_shelf.py
++msgid "File shelf is closed."
++msgstr "Полка закрыта."
++
++#: core/file_shelf.py
++msgid "Wait for the previous transfer to finish."
++msgstr "Дождитесь завершения предыдущей передачи."
++
++#: core/file_shelf.py
++msgid "Transferring files…"
++msgstr "Передача файлов…"
++
++#: core/file_shelf.py
++msgid "Files transferred."
++msgstr "Файлы переданы."
++
++#: core/file_shelf.py
++msgid "Could not transfer files. Check the connection and try again."
++msgstr "Не удалось передать файлы. Проверьте соединение и повторите."
++
+ #: core/fx_folio.py
+ msgid "Crease"
+ msgstr "Сгиб"
+@@ -1299,6 +1323,10 @@ msgstr "другой компьютер"
+ msgid "Beamer"
+ msgstr "Beamer"
+ 
++#: mac_app/bridge.py win_app/kvm_bridge_win.py
++msgid "Connect exactly one device that supports the file shelf."
++msgstr "Нужен один подключённый компьютер с поддержкой полки."
++
+ #: mac_app/bridge.py
+ msgid "Input returned to this Mac"
+ msgstr "Ввод возвращён на этот Mac"
+@@ -1535,6 +1563,14 @@ msgstr "{label}, {name}, этот Mac."
+ msgid "{label}, this Mac."
+ msgstr "{label}, этот Mac."
+ 
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Beamer file shelf"
++msgstr "Полка файлов Beamer"
++
++#: mac_app/file_shelf_mac.py win_app/file_shelf_win.py
++msgid "Drop files here or drag a received file out"
++msgstr "Перетащите файлы сюда или заберите полученный файл"
++
+ #: mac_app/kvm_bridge_app.py
+ msgid "Input on this Mac"
+ msgstr "Ввод на этом Mac"
+@@ -2516,6 +2552,14 @@ msgstr "На ПК Command передаётся как Control, поэтому Co
+ msgid "On a PC, each key arrives as the key in its place, so Command arrives as the Windows key. Between two Macs every key arrives as itself."
+ msgstr "На ПК каждая клавиша соответствует той же позиции, поэтому Command передаётся как клавиша Windows. Между двумя Mac каждая клавиша передаётся без изменений."
+ 
++#: mac_app/kvm_bridge_app.py
++msgid "File shelf"
++msgstr "Полка файлов"
++
++#: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
++msgid "Open file shelf"
++msgstr "Открыть полку файлов"
++
+ #: mac_app/kvm_bridge_app.py win_app/kvm_bridge_win.py
+ msgid "On"
+ msgstr "Вкл."
 diff --git a/mac_app/bridge.py b/mac_app/bridge.py
-index 5c6c5b5..0582d83 100644
+index 5c6c5b5..4656743 100644
 --- a/mac_app/bridge.py
 +++ b/mac_app/bridge.py
 @@ -13,6 +13,7 @@ import traceback
@@ -2066,7 +2295,7 @@ index 5c6c5b5..0582d83 100644
 +        links = [link for link in self._peers_up.values()
 +                 if link.live() and "file_shelf" in link.caps]
 +        if len(links) != 1 or self._file_shelf_links is None:
-+            notify("Нужен один подключённый компьютер с поддержкой полки.")
++            notify(tr("Connect exactly one device that supports the file shelf."))
 +            return False
 +        return self._file_shelf_links.send_files(links[0], paths, notify)
 +
@@ -2533,10 +2762,10 @@ index 0000000..14f35f6
 +            panel.orderOut_(None)
 diff --git a/mac_app/file_shelf_mac.py b/mac_app/file_shelf_mac.py
 new file mode 100644
-index 0000000..a34be9e
+index 0000000..54a72e8
 --- /dev/null
 +++ b/mac_app/file_shelf_mac.py
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,109 @@
 +"""A small Finder-compatible shelf window for explicit user file drops."""
 +from pathlib import Path
 +
@@ -2545,6 +2774,7 @@ index 0000000..a34be9e
 +from Foundation import NSURL, NSTimer
 +from PyObjCTools import AppHelper
 +import file_drag_mac
++from core.i18n import tr
 +
 +
 +class ShelfDropView(AppKit.NSView):
@@ -2595,12 +2825,12 @@ index 0000000..a34be9e
 +        rect = AppKit.NSMakeRect(80, 120, 320, 240)
 +        style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable | AppKit.NSWindowStyleMaskNonactivatingPanel
 +        self.panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, style, AppKit.NSBackingStoreBuffered, False)
-+        self.panel.setTitle_("Полка файлов Beamer")
++        self.panel.setTitle_(tr("Beamer file shelf"))
 +        self.panel.setFloatingPanel_(True)
 +        self.panel.setLevel_(AppKit.NSFloatingWindowLevel)
 +        self.view = ShelfDropView.alloc().initWithFrame_owner_(AppKit.NSMakeRect(0, 0, 320, 240), self)
 +        self.panel.setContentView_(self.view)
-+        self.header = AppKit.NSTextField.labelWithString_("Перетащите файл сюда или заберите полученный")
++        self.header = AppKit.NSTextField.labelWithString_(tr("Drop files here or drag a received file out"))
 +        self.header.setFrame_(AppKit.NSMakeRect(12, 205, 296, 24))
 +        self.view.addSubview_(self.header)
 +        self.status = AppKit.NSTextField.labelWithString_("")
@@ -2646,7 +2876,7 @@ index 0000000..a34be9e
 +        if had_files:
 +            self.show()
 diff --git a/mac_app/kvm_bridge_app.py b/mac_app/kvm_bridge_app.py
-index 49ea3f8..f6bb3fb 100644
+index 49ea3f8..29a9077 100644
 --- a/mac_app/kvm_bridge_app.py
 +++ b/mac_app/kvm_bridge_app.py
 @@ -2353,6 +2353,15 @@ class ControlWindow(AppKit.NSObject):
@@ -2659,8 +2889,8 @@ index 49ea3f8..f6bb3fb 100644
 +                self.controller._file_shelf_links.shelf, self.controller.send_shelf_files)
 +            self.controller.on_shelf_drag = lambda: AppHelper.callAfter(self.file_shelf_window.show)
 +            shelf_module = widgets.Module()
-+            shelf_module.add(widgets.Label("Полка файлов", theme.TYPE["body"]).view)
-+            shelf_module.add(widgets.Button("Открыть полку файлов", self, "openFileShelf:").view)
++            shelf_module.add(widgets.Label(tr("File shelf"), theme.TYPE["body"]).view)
++            shelf_module.add(widgets.Button(tr("Open file shelf"), self, "openFileShelf:").view)
 +            widgets.add(body, shelf_module.view)
          widgets.add(body, self.panel.machines_module.view)
          widgets.add(body, self.panel.own_name_module().view)
@@ -3118,12 +3348,13 @@ index 0000000..7bf308e
 +            self.files_retained.emit(paths, release)
 diff --git a/win_app/file_shelf_win.py b/win_app/file_shelf_win.py
 new file mode 100644
-index 0000000..5de7d97
+index 0000000..c94f414
 --- /dev/null
 +++ b/win_app/file_shelf_win.py
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +"""Small Windows shelf using real Qt/Explorer file drag events."""
 +from pathlib import Path
++from core.i18n import tr
 +from PySide6.QtCore import Qt, QTimer, QUrl, QMimeData, Signal
 +from PySide6.QtGui import QDrag
 +from PySide6.QtWidgets import QAbstractItemView, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
@@ -3172,10 +3403,10 @@ index 0000000..5de7d97
 +    def __init__(self, shelf, send, parent=None):
 +        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
 +        self.shelf, self.send = shelf, send
-+        self.setWindowTitle("Полка файлов Beamer")
++        self.setWindowTitle(tr("Beamer file shelf"))
 +        self.resize(300, 220)
 +        layout = QVBoxLayout(self)
-+        layout.addWidget(QLabel("Перетащите файл сюда или заберите полученный файл"))
++        layout.addWidget(QLabel(tr("Drop files here or drag a received file out")))
 +        self.status = QLabel("")
 +        self.status_changed.connect(self.status.setText)
 +        self.list = ShelfList(self._drop)
@@ -3205,7 +3436,7 @@ index 0000000..5de7d97
 +        if files and not self.isVisible():
 +            self.show()
 diff --git a/win_app/kvm_bridge_win.py b/win_app/kvm_bridge_win.py
-index abb6c37..239da4f 100644
+index abb6c37..c026a7e 100644
 --- a/win_app/kvm_bridge_win.py
 +++ b/win_app/kvm_bridge_win.py
 @@ -64,6 +64,9 @@ from app_config import (
@@ -3305,7 +3536,7 @@ index abb6c37..239da4f 100644
          )
          layout.addWidget(self.machines)
 +        if self.file_shelf_window is not None:
-+            shelf_button = QPushButton("Открыть полку файлов")
++            shelf_button = QPushButton(tr("Open file shelf"))
 +            shelf_button.clicked.connect(self.file_shelf_window.show)
 +            layout.addWidget(shelf_button)
          layout.addWidget(self._name_module(current))
@@ -3413,7 +3644,7 @@ index abb6c37..239da4f 100644
 +                 if "file_shelf" in self.sender.links.caps(peer)]
 +        links = [link for link in links if link is not None and link.live()]
 +        if len(links) != 1 or self._file_shelf_links is None:
-+            notify("Нужен один подключённый компьютер с поддержкой полки.")
++            notify(tr("Connect exactly one device that supports the file shelf."))
 +            return False
 +        self._file_drag_outbound_links[protocol.read_id(links[0].peer_id)] = links[0]
 +        return self._file_shelf_links.send_files(links[0], paths, notify)

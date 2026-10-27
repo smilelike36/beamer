@@ -17,12 +17,12 @@ jobs:
       - name: Apply verified file drag changes
         run: |
           $patch = "$PWD/beamer-file-drag.patch"
-          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne 'c101a2dd3b1e36e05062444c06fe87469b1514264a557c7be558b4fe7b53e25f') { throw 'Patch checksum mismatch' }
+          if ((Get-FileHash $patch -Algorithm SHA256).Hash.ToLower() -ne 'c0c4cf32d8fa629caafa91b32abef7d8f2cd14ff7a30864c9c94f0027eda082a') { throw 'Patch checksum mismatch' }
           git apply --check $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply $patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.3-drag-preview`n", [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText("$PWD/VERSION", "1.5.14-ru.4-drag-preview`n", [Text.UTF8Encoding]::new($false))
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
@@ -68,7 +68,7 @@ jobs:
           git rev-parse HEAD | Set-Content installer-output/COMMIT.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: Beamer-File-Drag-Windows-Installer
+          name: Beamer-File-Drag-Windows-ru4
           path: |
             installer-output/*.exe
             installer-output/SHA256SUMS.txt
